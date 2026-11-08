@@ -56,7 +56,7 @@ import { formatForDisplay, matchesKeyboardEvent, useAppHotkeys, useHotkey } from
 import { appHotkeys } from "../hotkeys";
 import { copyToClipboard } from "../clipboard";
 import { readClipboardImage } from "../clipboardImage";
-import { autoDir, ltr } from "../i18n";
+import { autoDir, fmtClock, fmtTimeLeft, ltr } from "../i18n";
 import { navigateKeyboardList } from "../keyboardNavigation";
 import { useLocale } from "../locale";
 import {
@@ -219,6 +219,7 @@ import {
   insertSlashCommand,
   isComposerCommand,
   parseComposerCommand,
+  parseGoal,
   removeSlashCommand,
   resolveComposerCommand,
   slashCommandContext,
@@ -5935,6 +5936,35 @@ export function ChatPanel({
       });
   };
   const sessionGoal = openSession?.goal?.trim() || "";
+  const goalDeadlineAt = sessionGoal ? openSession?.goalDeadlineAt ?? null : null;
+  const goalState = goalDeadlineAt ? openSession?.goalState ?? null : null;
+  const goalNote = openSession?.goalNote?.trim() || "";
+  const [goalClock, setGoalClock] = useState(() => Date.now());
+  useEffect(() => {
+    if (goalState !== "active") return;
+    setGoalClock(Date.now());
+    const timer = setInterval(() => setGoalClock(Date.now()), 60_000);
+    return () => clearInterval(timer);
+  }, [goalState]);
+  const goalLabel = goalState === "active" && goalDeadlineAt
+    ? m.chat_panel_goal_time_left({ time: fmtTimeLeft(goalDeadlineAt - goalClock) })
+    : goalState === "met"
+      ? m.chat_panel_goal_met()
+      : goalState === "expired"
+        ? m.chat_panel_goal_expired()
+        : goalState === "paused" ? m.chat_panel_goal_paused() : m.chat_panel_goal();
+  const goalStatus = !goalDeadlineAt
+    ? null
+    : goalState === "active"
+      ? m.chat_goal_active_note({ deadline: fmtClock(goalDeadlineAt) })
+      : goalState === "met"
+        ? goalNote ? m.chat_goal_met_note({ evidence: autoDir(goalNote) }) : m.chat_panel_goal_met()
+        : goalState === "expired"
+          ? m.chat_goal_expired_note({ deadline: fmtClock(goalDeadlineAt) })
+          : goalNote ? m.chat_goal_blocked_note({ reason: autoDir(goalNote) }) : m.chat_goal_stalled_note();
+  const clearGoal = goalStatus
+    ? m.chat_panel_clear_timed_goal({ status: goalStatus, goal: autoDir(sessionGoal) })
+    : m.chat_panel_clear_goal({ goal: autoDir(sessionGoal) });
   const planActive = acpMode ? acpMode.currentValue === "plan" : composerSelection?.harness === "claude-code"
     ? composerSelection.permissionMode === "plan"
     : planActivation === "command"
@@ -6127,12 +6157,17 @@ export function ChatPanel({
       }
     }
     const clearing = /^(clear|none|off)$/i.test(wanted);
+    const timed = parseGoal(wanted);
+    const deadline = timed.durationMs === null ? undefined : Date.now() + timed.durationMs;
     try {
       const session = await queueSessionMutation(() =>
-        setChatSessionGoalMutation.mutateAsync([sessionId, clearing ? null : wanted]),
+        setChatSessionGoalMutation.mutateAsync([sessionId, clearing ? null : timed.goal, deadline]),
       );
       setSessions((current) => current.map((candidate) => (candidate.id === session.id ? session : candidate)));
-      showAlert(clearing ? m.chat_goal_cleared() : m.chat_goal_set(), "success");
+      showAlert(
+        clearing ? m.chat_goal_cleared() : session.goalDeadlineAt ? m.chat_goal_set_until({ deadline: fmtClock(session.goalDeadlineAt) }) : m.chat_goal_set(),
+        "success",
+      );
     } catch (err) {
       if (!inSourceScope()) return;
       setSettingsError(m.chat_goal_failed({ error: ltr(err instanceof Error ? err.message : String(err)) }));
@@ -6626,8 +6661,10 @@ export function ChatPanel({
     const planPermissionMode = planRequested && activeHarness?.id === "claude-code"
       ? toggledPlanMode ? "plan" : "auto"
       : undefined;
+    // A timed goal reaches the agent without its time, which rides every turn as the deadline.
+    const timedGoal = goalRequested ? parseGoal(composerCommand ? composerCommand.prompt : originalText) : null;
     // Attachments travel in the order the text cites them.
-    const sending = citedAttachments(composerCommand ? composerCommand.prompt : originalText, attachments);
+    const sending = citedAttachments(timedGoal?.goal ?? (composerCommand ? composerCommand.prompt : originalText), attachments);
     const text = sending.text;
     const pending = sending.attachments;
     const attachmentsAtSend = attachments;
@@ -6638,6 +6675,7 @@ export function ChatPanel({
     const turnSignature = JSON.stringify({
       text,
       goal: goalRequested ? text : undefined,
+      goalDurationMs: timedGoal?.durationMs ?? undefined,
       plan: planRequested,
       images: pending.map((attachment) => ({
         mediaType: attachment.mediaType,
@@ -6728,8 +6766,10 @@ export function ChatPanel({
     if ((!text && pending.length === 0 && pendingAnnotations.length === 0) || (goalRequested && !text)) return;
     const persistMessageGoal = async (sessionId: string) => {
       if (!goalRequested) return;
-      const session = await setChatSessionGoalMutation.mutateAsync([sessionId, text]);
+      const deadline = timedGoal?.durationMs ? Date.now() + timedGoal.durationMs : undefined;
+      const session = await setChatSessionGoalMutation.mutateAsync([sessionId, text, deadline]);
       setSessions((current) => current.map((candidate) => candidate.id === session.id ? session : candidate));
+      if (session.goalDeadlineAt) showAlert(m.chat_goal_set_until({ deadline: fmtClock(session.goalDeadlineAt) }), "success");
     };
     const clientTurnId = retry?.id ?? `ct_${crypto.randomUUID()}`;
     const mode = retry ? retry.mode : busy && steering && !queue && !planRequested && !goalRequested ? "steer" : null;
@@ -8362,14 +8402,14 @@ export function ChatPanel({
                 </Tooltip>
               )}
               {(sessionGoal || goalArmed) && (
-                <Tooltip interactive content={goalArmed ? m.goal_command_description() : m.chat_panel_clear_goal({ goal: autoDir(sessionGoal) })}>
+                <Tooltip interactive content={goalArmed ? m.goal_command_usage() : clearGoal}>
                   <Button
                     type="button"
                     size="small"
                     variant="purple"
                     active
                     className="group max-w-60"
-                    aria-label={goalArmed ? m.chat_panel_goal() : m.chat_panel_clear_goal({ goal: autoDir(sessionGoal) })}
+                    aria-label={goalArmed ? m.chat_panel_goal() : clearGoal}
                     onClick={() => {
                       setGoalScope(null);
                       if (sessionGoal) void setGoal("clear");
@@ -8379,7 +8419,7 @@ export function ChatPanel({
                       <Goal className="absolute inset-0 transition-opacity group-hover:opacity-0 group-focus-visible:opacity-0" size={16} strokeWidth={1.5} />
                       <X className="absolute inset-0 opacity-0 transition-opacity group-hover:opacity-100 group-focus-visible:opacity-100" size={16} strokeWidth={1.5} />
                     </span>
-                    <span className="truncate">{m.chat_panel_goal()}</span>
+                    <span className="truncate">{goalArmed ? m.chat_panel_goal() : goalLabel}</span>
                   </Button>
                 </Tooltip>
               )}

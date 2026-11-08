@@ -11,11 +11,11 @@ use serde_json::{json, Value};
 use super::{harnesses_payload, reject_if_moving, ApiError, ApiResult, AppState, HarnessQuery};
 use crate::error::{anyhow, bail, Result};
 use crate::local::chat::{
-    delegation, news, OrxDisplay, OrxKind, OrxSource, PromptAnswer, TurnOverrides,
+    delegation, goal, news, OrxDisplay, OrxKind, OrxSource, PromptAnswer, TurnOverrides,
     ORX_MESSAGE_PREFIX,
 };
 use crate::local::model_routes;
-use crate::store::{Store, StoredChatSession};
+use crate::store::{GoalState, Store, StoredChatSession};
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -167,6 +167,19 @@ fn tools() -> Value {
             "description": "Stop a chat you delegated to, and every chat it delegated to in turn. Their queued messages stay queued.",
             "inputSchema": { "type": "object", "properties": { "chatId": chat_id }, "required": ["chatId"] },
         },
+        {
+            "name": "goal",
+            "description": "Read or settle the goal the user set for this chat. `status` shows the goal, its deadline and the time left. When the goal has a deadline, orx starts your next turn toward it whenever you end one with nothing in flight: `met` ends that once the goal is met, with the evidence; `blocked` stops it until the user returns, with what you need from them.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "action": { "type": "string", "enum": ["status", "met", "blocked"] },
+                    "evidence": { "type": "string", "description": "With `met`: the results that meet the goal, citing their runs." },
+                    "reason": { "type": "string", "description": "With `blocked`: what you cannot go on without, for the user." },
+                },
+                "required": ["action"],
+            },
+        },
     ])
 }
 
@@ -217,6 +230,24 @@ async fn call(
             Ok(format!("Unsubscribed from {}.", ids.join(", ")))
         }
         "wait" => wait(state, caller, args).await,
+        "goal" => {
+            let (settled, note) = match text(args, "action")? {
+                "status" => return Ok(goal::status(caller)),
+                "met" => (GoalState::Met, text(args, "evidence")?),
+                "blocked" => (GoalState::Paused, text(args, "reason")?),
+                other => bail!("Unknown action `{other}`; use `status`, `met` or `blocked`."),
+            };
+            if caller.goal.is_none() {
+                bail!("This chat has no goal.");
+            }
+            if !state.chat.settle_goal(&caller.id, settled, note).await? {
+                bail!("This chat's goal has no deadline orx is pursuing, so there is nothing to settle. Tell the user in your answer instead.");
+            }
+            Ok(match settled {
+                GoalState::Met => "Recorded the goal as met. orx starts no more turns toward it; summarize the result for the user.".into(),
+                _ => "Recorded that you are blocked. orx starts no more turns toward the goal until the user resumes it; tell them what you need.".into(),
+            })
+        }
         "status" => {
             let store = Store::open()?;
             let target = chat(&store, text(args, "chatId")?)?;

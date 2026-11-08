@@ -1259,6 +1259,11 @@ impl Store {
             "ALTER TABLE chat_sessions ADD COLUMN autonomy TEXT",
             "ALTER TABLE chat_sessions ADD COLUMN side_parent_session_id TEXT",
             "ALTER TABLE chat_sessions ADD COLUMN side_parent_leaf_id TEXT",
+            "ALTER TABLE chat_sessions ADD COLUMN goal_deadline_at INTEGER",
+            "ALTER TABLE chat_sessions ADD COLUMN goal_state TEXT",
+            "ALTER TABLE chat_sessions ADD COLUMN goal_note TEXT",
+            "ALTER TABLE chat_sessions ADD COLUMN goal_nudges INTEGER NOT NULL DEFAULT 0",
+            "ALTER TABLE chat_sessions ADD COLUMN goal_nudged_at INTEGER",
             "ALTER TABLE ui_state ADD COLUMN preferred_service_tier TEXT",
             "ALTER TABLE ui_state ADD COLUMN workspace_state_json TEXT",
             "ALTER TABLE ui_state ADD COLUMN preferred_autonomy TEXT",
@@ -1770,7 +1775,8 @@ impl Store {
         }
         Ok(self.conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM run_notices WHERE delivered_at IS NULL AND retired_at IS NULL)
-                OR EXISTS(SELECT 1 FROM chat_turns WHERE state IN ('preparing','retrying','running'))",
+                OR EXISTS(SELECT 1 FROM chat_turns WHERE state IN ('preparing','retrying','running'))
+                OR EXISTS(SELECT 1 FROM chat_sessions WHERE goal IS NOT NULL AND goal_state = 'active')",
             [], |row| row.get(0),
         )?)
     }
@@ -3892,12 +3898,83 @@ impl Store {
         Ok(())
     }
 
-    pub fn set_chat_session_goal(&self, id: &str, goal: Option<&str>) -> Result<()> {
+    /// Setting a goal, with or without a deadline, starts its pursuit afresh.
+    pub fn set_chat_session_goal(
+        &self,
+        id: &str,
+        goal: Option<&str>,
+        deadline_at: Option<i64>,
+    ) -> Result<()> {
+        let deadline_at = goal.and(deadline_at);
+        let now = now_ms();
         self.conn.execute(
-            "UPDATE chat_sessions SET goal = ?2, updated_at = ?3 WHERE id = ?1",
-            params![id, goal, now_ms()],
+            "UPDATE chat_sessions SET goal = ?2, goal_deadline_at = ?3,
+                 goal_state = CASE WHEN ?3 IS NULL THEN NULL ELSE 'active' END,
+                 goal_note = NULL, goal_nudges = 0, goal_nudged_at = ?4, updated_at = ?4
+             WHERE id = ?1",
+            params![id, goal, deadline_at, now],
         )?;
         Ok(())
+    }
+
+    /// End an active pursuit; false when there was none to end.
+    pub fn settle_chat_session_goal(
+        &self,
+        id: &str,
+        state: GoalState,
+        note: Option<&str>,
+    ) -> Result<bool> {
+        Ok(self.conn.execute(
+            "UPDATE chat_sessions SET goal_state = ?2, goal_note = ?3, updated_at = ?4
+             WHERE id = ?1 AND goal IS NOT NULL AND goal_state = 'active'",
+            params![id, state.id(), note, now_ms()],
+        )? == 1)
+    }
+
+    pub fn record_chat_session_goal_nudge(&self, id: &str, nudges: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE chat_sessions SET goal_nudges = ?2, goal_nudged_at = ?3
+             WHERE id = ?1 AND goal_state = 'active'",
+            params![id, nudges, now_ms()],
+        )?;
+        Ok(())
+    }
+
+    /// Every chat with an active goal, with what may still wake it on its own.
+    pub fn pursued_goals(&self) -> Result<Vec<PursuedGoal>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT s.id, s.goal_deadline_at, s.goal_nudges, COALESCE(s.goal_nudged_at, s.updated_at),
+                 EXISTS(SELECT 1 FROM runs r WHERE r.chat_session_id = s.id
+                            AND r.status IN ('submitting', 'starting', 'running'))
+                     OR EXISTS(SELECT 1 FROM run_subscriptions rs JOIN runs r ON r.id = rs.run_id
+                            WHERE rs.chat_session_id = s.id
+                            AND r.status IN ('submitting', 'starting', 'running')),
+                 EXISTS(SELECT 1 FROM run_notices n WHERE n.chat_session_id = s.id
+                            AND n.delivered_at IS NULL AND n.retired_at IS NULL)
+                     OR EXISTS(SELECT 1 FROM chat_run_wakeups w WHERE w.chat_session_id = s.id
+                            AND w.state = 'pending'),
+                 EXISTS(SELECT 1 FROM runs r WHERE r.chat_session_id = s.id
+                            AND r.created_at > COALESCE(s.goal_nudged_at, s.updated_at))
+                     OR EXISTS(SELECT 1 FROM local_experiments e WHERE e.chat_session_id = s.id
+                            AND e.created_at > COALESCE(s.goal_nudged_at, s.updated_at))
+                     OR EXISTS(SELECT 1 FROM chat_messages m WHERE m.session_id = s.id
+                            AND m.role = 'user' AND m.created_at > COALESCE(s.goal_nudged_at, s.updated_at))
+             FROM chat_sessions s
+             WHERE s.goal IS NOT NULL AND s.goal_deadline_at IS NOT NULL AND s.goal_state = 'active'
+             ORDER BY s.id",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(PursuedGoal {
+                session_id: row.get(0)?,
+                deadline_at: row.get(1)?,
+                nudges: row.get(2)?,
+                nudged_at: row.get(3)?,
+                runs_active: row.get(4)?,
+                notices_pending: row.get(5)?,
+                progressed: row.get(6)?,
+            })
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
     }
 
     /// Cleared after a compaction: the pre-compaction total would otherwise be
@@ -4962,6 +5039,8 @@ pub struct StoredChatSession {
     /// What the user asked the agent to keep working toward (`/goal`), carried
     /// into every turn until they clear it.
     pub goal: Option<String>,
+    /// Set when the goal has a deadline: orx then starts turns toward it on its own.
+    pub goal_pursuit: Option<GoalPursuit>,
     /// Research autonomy level id (`crate::local::autonomy`); `None` is the default.
     pub autonomy: Option<String>,
     /// Tip of the branch the UI is currently showing. Forked turns make the
@@ -4974,6 +5053,63 @@ pub struct StoredChatSession {
     pub side_parent_leaf_id: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
+}
+
+/// A goal with a deadline, which orx keeps the agent working toward.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GoalPursuit {
+    pub deadline_at: i64,
+    pub state: GoalState,
+    /// Why the pursuit stopped: the agent's evidence or reason, or orx's.
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum GoalState {
+    Active,
+    Met,
+    Expired,
+    Paused,
+}
+
+impl GoalState {
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Met => "met",
+            Self::Expired => "expired",
+            Self::Paused => "paused",
+        }
+    }
+
+    /// A state from a newer build stops the pursuit rather than resuming it.
+    fn from_stored(id: Option<&str>) -> Self {
+        match id {
+            Some("active") => Self::Active,
+            Some("met") => Self::Met,
+            Some("expired") => Self::Expired,
+            _ => Self::Paused,
+        }
+    }
+}
+
+/// An active goal's chat, and what may still wake it without orx's help.
+#[derive(Debug, Clone)]
+pub struct PursuedGoal {
+    pub session_id: String,
+    pub deadline_at: i64,
+    /// Turns orx started toward the goal since the chat last made progress.
+    pub nudges: i64,
+    /// When orx last started a turn toward the goal, or when the goal was set.
+    pub nudged_at: i64,
+    /// A run the chat launched or follows has not finished.
+    pub runs_active: bool,
+    /// A run result has not been delivered to the chat yet.
+    pub notices_pending: bool,
+    /// The chat launched a run, created an experiment or received a message
+    /// other than orx's nudge since `nudged_at`.
+    pub progressed: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -5130,7 +5266,8 @@ fn row_to_chat_turn(
 const CHAT_SESSION_COLS: &str = "id, project_id, harness, native_session_id, title, model, service_tier, \
      permission_mode, plan_mode, plan_reset_pending, reasoning_level, archived, context_usage_json, \
      created_at, updated_at, title_source, bootstrap_context, active_leaf_id, \
-     goal, autonomy, side_parent_session_id, side_parent_leaf_id";
+     goal, autonomy, side_parent_session_id, side_parent_leaf_id, \
+     goal_deadline_at, goal_state, goal_note";
 
 fn row_to_chat_session(
     row: &rusqlite::Row<'_>,
@@ -5155,6 +5292,16 @@ fn row_to_chat_session(
         bootstrap_context: row.get(16)?,
         active_leaf_id: row.get(17)?,
         goal: row.get(18)?,
+        goal_pursuit: row
+            .get::<_, Option<i64>>(22)?
+            .map(|deadline_at| -> rusqlite::Result<_> {
+                Ok(GoalPursuit {
+                    deadline_at,
+                    state: GoalState::from_stored(row.get::<_, Option<String>>(23)?.as_deref()),
+                    note: row.get(24)?,
+                })
+            })
+            .transpose()?,
         autonomy: row.get(19)?,
         side_parent_session_id: row.get(20)?,
         side_parent_leaf_id: row.get(21)?,
@@ -9993,9 +10140,115 @@ mod tests {
             active_leaf_id: None,
             side_parent_session_id: None,
             side_parent_leaf_id: None,
+            goal_pursuit: None,
             created_at: 1,
             updated_at: 1,
         }
+    }
+
+    #[test]
+    fn a_goal_with_a_deadline_is_pursued_until_settled_and_keeps_orx_up_meanwhile() {
+        let dir = std::env::temp_dir().join(format!("orx-goal-{}", uuid::Uuid::new_v4()));
+        let store = Store::open_at(dir.clone()).unwrap();
+        store
+            .create_chat_session(&chat_session_fixture("chat"))
+            .unwrap();
+        store
+            .set_chat_session_goal("chat", Some("halve latency"), None)
+            .unwrap();
+        let plain = store.get_chat_session("chat").unwrap().unwrap();
+        assert_eq!(plain.goal.as_deref(), Some("halve latency"));
+        assert_eq!(plain.goal_pursuit, None);
+        assert!(store.pursued_goals().unwrap().is_empty());
+        assert!(!store.engine_idle_blocked().unwrap());
+
+        let deadline = now_ms() + 86_400_000;
+        store
+            .set_chat_session_goal("chat", Some("halve latency"), Some(deadline))
+            .unwrap();
+        let pursued = store.get_chat_session("chat").unwrap().unwrap();
+        assert_eq!(
+            pursued.goal_pursuit,
+            Some(GoalPursuit {
+                deadline_at: deadline,
+                state: GoalState::Active,
+                note: None,
+            })
+        );
+        assert_eq!(store.pursued_goals().unwrap().len(), 1);
+        assert!(store.engine_idle_blocked().unwrap());
+
+        assert!(store
+            .settle_chat_session_goal("chat", GoalState::Met, Some("p50 latency -52%"))
+            .unwrap());
+        assert!(!store
+            .settle_chat_session_goal("chat", GoalState::Paused, None)
+            .unwrap());
+        let met = store.get_chat_session("chat").unwrap().unwrap();
+        let pursuit = met.goal_pursuit.unwrap();
+        assert_eq!(pursuit.state, GoalState::Met);
+        assert_eq!(pursuit.note.as_deref(), Some("p50 latency -52%"));
+        assert!(store.pursued_goals().unwrap().is_empty());
+        assert!(!store.engine_idle_blocked().unwrap());
+
+        store
+            .set_chat_session_goal("chat", None, Some(deadline))
+            .unwrap();
+        let cleared = store.get_chat_session("chat").unwrap().unwrap();
+        assert_eq!((cleared.goal, cleared.goal_pursuit), (None, None));
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_pursued_goal_reports_what_will_wake_its_chat_and_whether_it_progressed() {
+        let dir = std::env::temp_dir().join(format!("orx-goal-facts-{}", uuid::Uuid::new_v4()));
+        let store = Store::open_at(dir.clone()).unwrap();
+        store
+            .create_chat_session(&chat_session_fixture("chat"))
+            .unwrap();
+        store
+            .set_chat_session_goal("chat", Some("halve latency"), Some(now_ms() + 86_400_000))
+            .unwrap();
+        let facts = || store.pursued_goals().unwrap().remove(0);
+        let quiet = facts();
+        assert!(!quiet.runs_active && !quiet.notices_pending && !quiet.progressed);
+
+        store
+            .conn
+            .execute(
+                "INSERT INTO chat_messages (id, session_id, role, parts_json, created_at)
+                 VALUES ('before', 'chat', 'user', '[]', 1)",
+                [],
+            )
+            .unwrap();
+        assert!(!facts().progressed);
+        store
+            .conn
+            .execute(
+                "INSERT INTO runs (id, experiment_id, project_id, status, backend_json,
+                                   created_at, updated_at, chat_session_id)
+                 VALUES ('run', 'exp', 'project', 'running', '{}', ?1, ?1, 'chat')",
+                [now_ms() + 1_000],
+            )
+            .unwrap();
+        let launched = facts();
+        assert!(launched.runs_active && launched.progressed);
+
+        store
+            .conn
+            .execute("UPDATE runs SET status = 'done' WHERE id = 'run'", [])
+            .unwrap();
+        store
+            .insert_run_notice("run", "chat", TERMINAL, TERMINAL, "done", 1)
+            .unwrap();
+        let finished = facts();
+        assert!(!finished.runs_active && finished.notices_pending);
+
+        store.record_chat_session_goal_nudge("chat", 2).unwrap();
+        assert_eq!(facts().nudges, 2);
+        drop(store);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

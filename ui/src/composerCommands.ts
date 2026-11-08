@@ -21,7 +21,7 @@ export type ComposerCommandName = (typeof COMPOSER_COMMANDS)[number];
 
 const COMMAND_DESCRIPTIONS: Record<ComposerCommandName, () => string> = {
   plan: () => m.plan_command_description(),
-  goal: () => m.goal_command_description(),
+  goal: () => m.goal_command_usage(),
   new: () => m.new_command_description(),
   resume: () => m.resume_command_description(),
   model: () => m.model_command_description(),
@@ -169,6 +169,17 @@ export function commandsForHarness(
     const group = Number(b.source === "command") - Number(a.source === "command");
     return group || commandLabel(a).localeCompare(commandLabel(b), undefined, { sensitivity: "base" });
   });
+}
+
+const GOAL_TIME_UNITS: Record<string, number> = { m: 60_000, h: 3_600_000, d: 86_400_000, w: 604_800_000 };
+
+/** A goal led by a time, as in `7d: halve latency`, is one the agent works
+ * toward on its own for that long; any other goal is a reminder each turn. */
+export function parseGoal(text: string): { goal: string; durationMs: number | null } {
+  const goal = text.trim();
+  const timed = /^(\d+(?:\.\d+)?)\s*([mhdw])\s*:\s*(\S[\s\S]*)$/i.exec(goal);
+  const durationMs = timed ? Number(timed[1]) * GOAL_TIME_UNITS[timed[2].toLowerCase()] : 0;
+  return timed && durationMs > 0 ? { goal: timed[3].trim(), durationMs } : { goal, durationMs: null };
 }
 
 /** Commands that read the rest of the message: Plan as the prompt to plan,

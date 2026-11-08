@@ -9,6 +9,7 @@
 //! the message and broadcasts it as a `chat.message` SSE event.
 
 pub mod delegation;
+pub mod goal;
 pub(crate) mod handoff;
 pub mod news;
 pub(crate) mod subagent;
@@ -31,8 +32,8 @@ use crate::local::harness::ResumeAction;
 use crate::local::model::LocalProject;
 use crate::local::opencode::AgentHost;
 use crate::store::{
-    now_ms, ChatTurnAdmission, Store, StoredChatMessage, StoredChatSession, StoredChatTurn,
-    StoredQueuedChatMessage,
+    now_ms, ChatTurnAdmission, GoalState, Store, StoredChatMessage, StoredChatSession,
+    StoredChatTurn, StoredQueuedChatMessage,
 };
 
 /// Min interval between mid-turn persist+broadcast flushes (streaming parts
@@ -1269,6 +1270,7 @@ pub fn import_native_chat(
         active_leaf_id: None,
         side_parent_session_id: None,
         side_parent_leaf_id: None,
+        goal_pursuit: None,
         created_at: now_ms(),
         updated_at: now_ms(),
     };
@@ -1361,6 +1363,9 @@ pub fn session_json_with(store: Option<&Store>, s: &StoredChatSession, busy: boo
         "sideParentSessionId": s.side_parent_session_id,
         "delegate": delegate,
         "goal": s.goal,
+        "goalDeadlineAt": s.goal_pursuit.as_ref().map(|pursuit| pursuit.deadline_at),
+        "goalState": s.goal_pursuit.as_ref().map(|pursuit| pursuit.state),
+        "goalNote": s.goal_pursuit.as_ref().and_then(|pursuit| pursuit.note.as_deref()),
         "autonomy": Autonomy::from_stored(s.autonomy.as_deref()).id(),
     })
 }
@@ -1396,10 +1401,7 @@ fn with_turn_context(
     let mut contexts = Vec::new();
     // The goal rides every turn: the agent has to be told it again each time,
     // and it outlives compaction and a lost native session.
-    let goal = goal.map(|goal| {
-        format!("<orx-goal>\nKeep working toward this goal until it is met, across every turn:\n\n{goal}\n</orx-goal>")
-    });
-    if let Some(goal) = goal.as_deref() {
+    if let Some(goal) = goal {
         contexts.push(goal);
     }
     if let Some(autonomy) = autonomy {
@@ -2280,9 +2282,11 @@ mod initial_message_tests {
         assert!(!is_initial_chat_message(Some("resume"), false));
     }
 
+    const GOAL: &str = "<orx-goal>\nship the sweep\n</orx-goal>";
+
     #[test]
     fn the_goal_rides_every_turn() {
-        let seeded = with_turn_context(Some("ship the sweep"), None, None, None, "continue".into());
+        let seeded = with_turn_context(Some(GOAL), None, None, None, "continue".into());
         assert!(seeded.contains("ship the sweep"));
         assert!(seeded.contains("<current-user-message>\ncontinue"));
         assert_eq!(
@@ -2294,7 +2298,7 @@ mod initial_message_tests {
     #[test]
     fn autonomy_rides_every_turn_after_the_goal() {
         let turn = with_turn_context(
-            Some("ship the sweep"),
+            Some(GOAL),
             Autonomy::Copilot.turn_context(),
             None,
             None,
@@ -6024,7 +6028,7 @@ impl ChatHost {
                 expanded = format!("{message_ref}\n{expanded}");
             }
             with_turn_context(
-                session.goal.as_deref(),
+                goal::turn_context(&session, now_ms()).as_deref(),
                 Autonomy::from_stored(session.autonomy.as_deref()).turn_context(),
                 super::demo::turn_context(&project.id),
                 shell_context.as_deref(),
@@ -6885,15 +6889,33 @@ impl ChatHost {
         Ok(session)
     }
 
-    /// Set (or, with `None`, clear) the goal every turn is reminded of.
+    /// Set (or, with `None`, clear) the goal every turn is reminded of. With a
+    /// deadline, orx also starts turns toward it until then.
     pub async fn set_goal(
         &self,
         session_id: &str,
         goal: Option<&str>,
+        deadline_at: Option<i64>,
     ) -> Result<Option<StoredChatSession>> {
         let store = Store::open()?;
-        store.set_chat_session_goal(session_id, goal)?;
+        store.set_chat_session_goal(session_id, goal, deadline_at)?;
         Ok(self.emit_session(store.get_chat_session(session_id)?).await)
+    }
+
+    /// End the chat's goal pursuit as its agent reports it met or blocked;
+    /// false when no pursuit was active.
+    pub async fn settle_goal(
+        &self,
+        session_id: &str,
+        state: GoalState,
+        note: &str,
+    ) -> Result<bool> {
+        let store = Store::open()?;
+        if !store.settle_chat_session_goal(session_id, state, Some(note))? {
+            return Ok(false);
+        }
+        self.emit_session(store.get_chat_session(session_id)?).await;
+        Ok(true)
     }
 
     pub async fn set_autonomy(
@@ -8759,6 +8781,7 @@ fn side_chat_session(
         active_leaf_id: None,
         side_parent_session_id: Some(parent.id.clone()),
         side_parent_leaf_id: leaf.cloned(),
+        goal_pursuit: None,
         created_at: now,
         updated_at: now,
     }
@@ -9149,6 +9172,12 @@ pub async fn keep_turn_leases(
             news::deliver_news(&chat, store, Some(data_dir_move_in_progress.as_ref())).await
         {
             eprintln!("orx up: news watcher: {err}");
+        }
+        let Ok(store) = Store::open() else { continue };
+        if let Err(err) =
+            goal::pursue_goals(&chat, store, Some(data_dir_move_in_progress.as_ref())).await
+        {
+            eprintln!("orx up: goal keeper: {err}");
         }
     }
 }
@@ -9763,6 +9792,7 @@ mod cap_tests {
                 active_leaf_id: None,
                 side_parent_session_id: None,
                 side_parent_leaf_id: None,
+                goal_pursuit: None,
                 created_at: 1,
                 updated_at: 1,
             })
@@ -9872,6 +9902,7 @@ mod cap_tests {
             active_leaf_id: None,
             side_parent_session_id: None,
             side_parent_leaf_id: None,
+            goal_pursuit: None,
             created_at: 1,
             updated_at: 1,
         };
@@ -9947,6 +9978,7 @@ mod cap_tests {
             active_leaf_id: None,
             side_parent_session_id: None,
             side_parent_leaf_id: None,
+            goal_pursuit: None,
             created_at: 1,
             updated_at: 1,
         };
@@ -10895,6 +10927,7 @@ mod bridge_tests {
             active_leaf_id: None,
             side_parent_session_id: None,
             side_parent_leaf_id: None,
+            goal_pursuit: None,
             created_at: 1,
             updated_at: 1,
         }
@@ -11731,6 +11764,7 @@ mod run_wakeup_tests {
                 active_leaf_id: None,
                 side_parent_session_id: None,
                 side_parent_leaf_id: None,
+                goal_pursuit: None,
                 created_at: 1,
                 updated_at: 1,
             })
@@ -11791,6 +11825,172 @@ mod run_wakeup_tests {
         )
         .unwrap();
         tx.commit().unwrap();
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_pursued_goal_nudges_a_quiet_chat_until_it_stalls_and_wraps_up_at_its_deadline() {
+        if !crate::config::in_test_child(&[]) {
+            return;
+        }
+        let store = Store::open().unwrap();
+        let repo = crate::store::data_dir().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        crate::local::git::initialize_own_repository(&repo).unwrap();
+        store
+            .create_local_project(&crate::local::model::LocalProject {
+                id: "p1".into(),
+                name: "goal".into(),
+                slug: "goal".into(),
+                github_owner: String::new(),
+                github_repo: String::new(),
+                github_sync_enabled: false,
+                baseline_branch: "main".into(),
+                repo_path: repo.to_string_lossy().into_owned(),
+                run_command: None,
+                paper_id: None,
+                created_at: 1,
+                updated_at: 1,
+            })
+            .unwrap();
+        session(&store, "pursuer");
+        notice_harness(&store);
+        let prompts = crate::store::data_dir().join("prompts");
+        let mut launch = store.acp_session_state("pursuer").unwrap().unwrap().launch;
+        launch.executable = if cfg!(windows) { "python" } else { "python3" }.into();
+        launch.arguments = vec![
+            "-u".into(),
+            "-c".into(),
+            format!(
+                r#"
+import json, sys
+for line in sys.stdin:
+    request = json.loads(line)
+    if 'id' not in request:
+        continue
+    method = request['method']
+    if method == 'initialize':
+        result = {{'protocolVersion':1, 'agentCapabilities':{{'loadSession':True}}}}
+    elif method == 'session/new':
+        result = {{'sessionId':'goal'}}
+    elif method == 'session/prompt':
+        with open({prompts:?}, 'a') as log:
+            log.write(json.dumps(request['params']) + '\n')
+        result = {{'stopReason':'end_turn'}}
+    else:
+        result = {{}}
+    print(json.dumps({{'jsonrpc':'2.0','id':request['id'],'result':result}}), flush=True)
+"#,
+                prompts = prompts.to_string_lossy()
+            ),
+        ];
+        let tx = store.begin().unwrap();
+        tx.execute(
+            "UPDATE acp_sessions SET launch_json = ?1 WHERE session_id = 'pursuer'",
+            [serde_json::to_string(&launch).unwrap()],
+        )
+        .unwrap();
+        tx.commit().unwrap();
+
+        let host = notice_host();
+        let keep = || async {
+            goal::pursue_goals(&host, Store::open().unwrap(), None)
+                .await
+                .unwrap()
+        };
+        let count_turns = || {
+            store
+                .begin()
+                .unwrap()
+                .query_row("SELECT COUNT(*) FROM chat_turns", [], |row| {
+                    row.get::<_, i64>(0)
+                })
+                .unwrap()
+        };
+        let settle = |turns: i64| {
+            let (host, count_turns) = (&host, &count_turns);
+            async move {
+                tokio::time::timeout(Duration::from_secs(15), async {
+                    while count_turns() < turns || !host.busy_sessions().await.is_empty() {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+            }
+        };
+        // Moves the chat's whole history an hour back, past the quiet period.
+        let quiet = || {
+            let tx = store.begin().unwrap();
+            tx.execute_batch(
+                "UPDATE chat_sessions SET goal_nudged_at = goal_nudged_at - 3600000;
+                 UPDATE chat_turns SET updated_at = updated_at - 3600000;
+                 UPDATE chat_messages SET created_at = created_at - 3600000;",
+            )
+            .unwrap();
+            tx.commit().unwrap();
+        };
+        let state = || {
+            store
+                .get_chat_session("pursuer")
+                .unwrap()
+                .unwrap()
+                .goal_pursuit
+                .unwrap()
+                .state
+        };
+
+        store
+            .set_chat_session_goal(
+                "pursuer",
+                Some("halve p50 latency"),
+                Some(now_ms() + 86_400_000),
+            )
+            .unwrap();
+        keep().await;
+        assert_eq!(count_turns(), 0, "the user gets the quiet period first");
+
+        for nudge in 1..=3 {
+            quiet();
+            keep().await;
+            settle(nudge).await;
+            assert_eq!(count_turns(), nudge);
+            assert_eq!(store.pursued_goals().unwrap()[0].nudges, nudge);
+        }
+        let told = std::fs::read_to_string(&prompts).unwrap();
+        assert!(told.contains("Start working toward the goal"));
+        assert!(told.contains("You ended your last turn with nothing in flight"));
+        assert!(told.contains("orx-goal deadline="));
+        assert!(told.contains("halve p50 latency"));
+
+        quiet();
+        keep().await;
+        assert_eq!(
+            count_turns(),
+            3,
+            "a fourth turn without progress is not started"
+        );
+        assert_eq!(state(), GoalState::Paused);
+
+        store
+            .set_chat_session_goal(
+                "pursuer",
+                Some("halve p50 latency"),
+                Some(now_ms() + 86_400_000),
+            )
+            .unwrap();
+        let tx = store.begin().unwrap();
+        tx.execute("UPDATE chat_sessions SET goal_deadline_at = 1", [])
+            .unwrap();
+        tx.commit().unwrap();
+        keep().await;
+        settle(4).await;
+        assert_eq!(state(), GoalState::Expired);
+        assert!(std::fs::read_to_string(&prompts)
+            .unwrap()
+            .contains("deadline has passed"));
+        quiet();
+        keep().await;
+        assert_eq!(count_turns(), 4);
     }
 
     #[tokio::test(flavor = "current_thread")]
@@ -12820,6 +13020,7 @@ mod transcript_tree_tests {
             active_leaf_id: Some("a3".into()),
             side_parent_session_id: None,
             side_parent_leaf_id: None,
+            goal_pursuit: None,
             created_at: 1,
             updated_at: 1,
         }
@@ -13069,6 +13270,7 @@ mod steering_tests {
                 active_leaf_id: None,
                 side_parent_session_id: None,
                 side_parent_leaf_id: None,
+                goal_pursuit: None,
                 created_at: 1,
                 updated_at: 1,
             })

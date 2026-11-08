@@ -8598,6 +8598,7 @@ async fn create_chat_session(
         active_leaf_id: None,
         side_parent_session_id: None,
         side_parent_leaf_id: None,
+        goal_pursuit: None,
         created_at: now_ms(),
         updated_at: now_ms(),
     };
@@ -8720,6 +8721,8 @@ struct UpdateChatSessionReq {
     /// Present-and-null clears the goal, which is why it is doubly wrapped.
     #[serde(default, deserialize_with = "present_nullable_string")]
     goal: Option<Option<String>>,
+    /// With `goal`: orx starts turns toward it until this time (epoch ms).
+    goal_deadline_at: Option<i64>,
     autonomy: Option<Autonomy>,
     /// `false` keeps a delegate for the user: see `release_delegate`.
     notify_parent: Option<bool>,
@@ -8879,9 +8882,17 @@ async fn update_chat_session(
         let goal = goal
             .map(|goal| goal.trim().to_string())
             .filter(|goal| !goal.is_empty());
+        if req
+            .goal_deadline_at
+            .is_some_and(|deadline| deadline <= crate::store::now_ms())
+        {
+            return Err(bad_request(
+                "The goal's deadline has already passed. Give it a time in the future.",
+            ));
+        }
         state
             .chat
-            .set_goal(&id, goal.as_deref())
+            .set_goal(&id, goal.as_deref(), req.goal_deadline_at)
             .await?
             .ok_or_else(|| not_found("chat session"))?
     } else if let Some(permission_mode) = req.permission_mode {

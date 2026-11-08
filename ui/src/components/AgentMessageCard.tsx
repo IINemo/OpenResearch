@@ -1,5 +1,5 @@
 import { useContext, useState, type ComponentProps } from "react";
-import { ChevronDown, CircleAlert, CircleCheck, CircleX, MessagesSquare, TriangleAlert } from "lucide-react";
+import { ChevronDown, CircleAlert, CircleCheck, CircleX, Goal, MessagesSquare, TriangleAlert } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
 
 import { fmtDuration, type ChatPart, type OrxSource } from "../api";
@@ -56,22 +56,27 @@ function RunCard({ part, runExperimentName, onOpenRun }: Props) {
   );
 }
 
-/** A task, message, answer or question from another chat, or orx's warning
- * about runs: its sender opens that chat, the rest opens the whole message. */
+/** A task, message, answer or question from another chat, orx's warning
+ * about runs, or orx keeping the chat at its goal: its sender opens that chat,
+ * the rest opens the whole message. */
 function SentCard({ part, onOpenFile, onOpenRun }: Props) {
   const [open, setOpen] = useState(false);
   const links = useContext(ChatLinksContext);
   const { kind, from } = part.orx;
   const text = part.text ?? "";
+  // A message with no sender is orx's own, written only to keep the chat working toward its goal.
+  const goal = kind === "message" && !from;
   const chat = kind === "monitoring" || !from ? undefined : links?.chat(from);
-  const sender = kind === "monitoring"
+  const sender = kind === "monitoring" || goal
     ? m.agent_message_openresearch()
     : chat?.title || m.agent_message_other_chat();
   const icon = kind === "monitoring"
     ? <TriangleAlert size={16} aria-hidden="true" className="shrink-0 text-accent-amber" />
-    : chat
-      ? <HarnessLogo harness={chat.harness} size={16} />
-      : <MessagesSquare size={16} aria-hidden="true" className="shrink-0" />;
+    : goal
+      ? <Goal size={16} aria-hidden="true" className="shrink-0" />
+      : chat
+        ? <HarnessLogo harness={chat.harness} size={16} />
+        : <MessagesSquare size={16} aria-hidden="true" className="shrink-0" />;
   const preview = kind === "monitoring" ? m.agent_message_runs_unmonitored() : firstLine(text);
   const senderClass = "flex min-w-0 max-w-[45%] shrink-0 items-center gap-2 py-1.5 ps-3 pe-1 text-subtext [&_svg]:text-subtext";
   return (

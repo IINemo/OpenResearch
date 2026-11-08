@@ -73,7 +73,7 @@ OpenCode runs local inference over connections to OpenAI-compatible servers (`sr
 - **Skills.** Bundled (`agent-skills/`) and user-uploaded skills are written into the worktree's native skills folder before each turn, so they never drift from the binary; OpenCode gets them when its server starts. Skills the project or the user's agent already has are found by the agent itself.
 - **The `orx` CLI.** The running `orx`'s directory goes first on `PATH`, and on Unix shell hooks keep it first after the user's startup files, so the agent runs the dashboard's version. The environment names the chat, the dashboard's port and the server's bearer, which is how `orx exp run` records its chat.
 - **alphaXiv tools.** `orx alphaxiv-mcp` (`src/commands/alphaxiv_mcp.rs`) passes an allowlist of tools to Claude Code, Codex, OpenCode and ACP agents; Cursor and Antigravity use `orx alphaxiv library`. Tokens stay in orx ([storage](storage.md)). A sign-in change restarts a resident agent on its next turn with its session resumed. Write tools carry an ask rule, but ACP agents get no per-tool rule and `codex exec` cannot prompt, so there the agent's own policy decides.
-- **Turn context.** Autonomy and the goal ride the turn as context blocks, so changing them never restarts the agent.
+- **Turn context.** Autonomy and the goal ride the turn as context blocks, so changing them never restarts the agent. A goal with a deadline also tells the agent the time left and how to report it met or blocked ([below](#goals-with-a-deadline)).
 
 ## Permissions
 
@@ -90,6 +90,17 @@ The bridge endpoint grants permissions, so it takes a per-child token that each 
 **A held request never allows by accident.** A request outliving its turn is denied, an interrupted turn denies everything it was waiting on, a transport error denies, and the bridge denies an unanswered request after a long timeout. The no-output watchdog ignores a turn blocked on the user, whose thinking time is unbounded.
 
 Where an agent offers a hook or plugin, it stamps each shell command with the issuing model, so a run records which model launched it (`src/commands/invocation_gate.rs`).
+
+## Goals with a deadline
+
+A goal is a reminder each turn; with a deadline, orx also pursues it (`src/local/chat/goal.rs`). An agent stops whenever it ends a turn with nothing to wake it, so when a pursuing chat is idle, its latest turn completed, and no run, result, delegate or question to the user is outstanding, orx starts its next turn after a quiet period that lets the user speak first.
+
+- **The agent ends it** with the `goal` tool of `orx mcp`: `met` with its evidence, or `blocked` with what it needs from the user, which pauses the pursuit.
+- **The deadline ends it.** The chat gets one last turn to report where the goal stands, then the pursuit expires. Runs in flight still report.
+- **Stalling ends it.** Turns orx starts that launch no run or experiment and draw no reply count up; a few in a row pause the pursuit.
+- **A failed or stopped turn is the user's.** orx never talks over a recovery choice or a Stop; the pursuit resumes after the next completed turn.
+
+A pursued goal keeps a headless `orx up` running, and the desktop app in the background when its window closes.
 
 ## Turns survive restarts
 

@@ -45,6 +45,9 @@ runtime, in which case that outcome is exactly its result).
 user. Different errors still count; a bare relaunch or a flavor/backend switch
 is a repair. If the same failure hits a second node, that is one setup problem
 — ask then. (Separate from the "~3 failed or regressed runs" scientific stop.)
+Under a goal with a deadline (an `<orx-goal deadline=…>` block), take a
+different approach instead of asking, unless only the user can fix it, such as
+credentials or access.
 
 ## Shape the tree — stacked bushes, not a flat fan or a noodle
 
@@ -166,6 +169,10 @@ intended flow — do **not** edit a frozen node or rewrite the run command:
    down the tree, it never rewrites a node that already measured something.
 
 Stop when the goal is met, or after ~3 consecutive failed or regressed runs.
+Under a goal with a deadline, those failures mean change direction (a new
+round, an idea from the literature, delegates exploring in parallel); stop only
+when the goal is met, reporting it with the orx `goal` tool, or when the
+deadline passes.
 When you stop, write up the tree as a descriptively named project artifact — see
 the `orx-reports` skill for naming and folder guidance.
 

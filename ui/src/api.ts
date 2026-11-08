@@ -168,6 +168,7 @@ export interface UiState {
 
 /** How much of the research the agent owns before checking in. */
 export type Autonomy = "copilot" | "agentic";
+export type GoalState = "active" | "met" | "expired" | "paused";
 export const DEFAULT_AUTONOMY: Autonomy = "agentic";
 
 export interface ProjectPathStatus {
@@ -1389,6 +1390,11 @@ export interface ChatSession {
   planMode: boolean;
   /** What `/goal` asked the agent to keep working toward; null when unset. */
   goal?: string | null;
+  /** Set when the goal has a deadline: OpenResearch starts turns toward it until then. */
+  goalDeadlineAt?: number | null;
+  goalState?: GoalState | null;
+  /** Why a goal with a deadline stopped, in the agent's words: its evidence or what it needs. */
+  goalNote?: string | null;
   autonomy: Autonomy;
   reasoningLevel: string | null;
   /** Hidden from the default Recents list, but fully intact and resumable. */
@@ -2619,9 +2625,9 @@ export function createApi(
       (r) => r.session,
     );
 
-  /** `null` clears the goal. */
-  const setChatSessionGoal = (sessionId: string, goal: string | null) =>
-    patch<{ session: ChatSession }>(`/api/chat/sessions/${sessionId}`, { goal }).then(
+  /** `null` clears the goal. With a deadline, the agent works toward it on its own until then. */
+  const setChatSessionGoal = (sessionId: string, goal: string | null, goalDeadlineAt?: number) =>
+    patch<{ session: ChatSession }>(`/api/chat/sessions/${sessionId}`, { goal, goalDeadlineAt }).then(
       (r) => r.session,
     );
 

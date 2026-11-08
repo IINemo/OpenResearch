@@ -15,6 +15,15 @@ export function fmtClock(ms: number): string {
   return new Intl.DateTimeFormat(getLocale(), options).format(ms);
 }
 
+/** The largest whole unit of time left: "6d", "5h", "12m". */
+export function fmtTimeLeft(ms: number): string {
+  const minutes = Math.max(1, Math.floor(ms / 60_000));
+  const [unit, value] = minutes >= 1440
+    ? ["day", Math.floor(minutes / 1440)]
+    : minutes >= 60 ? ["hour", Math.floor(minutes / 60)] : ["minute", minutes];
+  return new Intl.NumberFormat(getLocale(), { style: "unit", unit, unitDisplay: "narrow" }).format(value);
+}
+
 const BYTE_UNITS = [["gigabyte", 1024 ** 3], ["megabyte", 1024 ** 2], ["kilobyte", 1024]] as const;
 
 /** Binary sizes with the familiar unit names: "3.97 GB", "64 MB". */

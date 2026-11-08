@@ -886,6 +886,7 @@ fn shared_session(
         active_leaf_id: leaf,
         side_parent_session_id: None,
         side_parent_leaf_id: None,
+        goal_pursuit: None,
         created_at: shared.created_at,
         updated_at: shared.updated_at,
     };
@@ -1020,6 +1021,7 @@ mod tests {
             active_leaf_id: None,
             side_parent_session_id: None,
             side_parent_leaf_id: None,
+            goal_pursuit: None,
             created_at: 1,
             updated_at: 1,
         }
