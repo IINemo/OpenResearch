@@ -12749,7 +12749,7 @@ mod run_wakeup_tests {
         notice_harness(&store);
         let prompts = crate::store::data_dir().join("prompts");
         let mut launch = store.acp_session_state("pursuer").unwrap().unwrap().launch;
-        launch.executable = if cfg!(windows) { "python" } else { "python3" }.into();
+        launch.executable = crate::local::acp::fake_agent_interpreter("python3");
         launch.arguments = vec![
             "-u".into(),
             "-c".into(),
@@ -12763,8 +12763,8 @@ for line in sys.stdin:
     method = request['method']
     if method == 'initialize':
         result = {{'protocolVersion':1, 'agentCapabilities':{{'loadSession':True}}}}
-    elif method == 'session/new':
-        result = {{'sessionId':'goal'}}
+    elif method in ('session/new', 'session/load'):
+        result = {{'sessionId':'goal', 'models':{{'currentModelId':'fixture-model', 'availableModels':[{{'modelId':'fixture-model', 'name':'Fixture model'}}]}}}}
     elif method == 'session/prompt':
         with open({prompts:?}, 'a') as log:
             log.write(json.dumps(request['params']) + '\n')
@@ -12800,15 +12800,25 @@ for line in sys.stdin:
                 .unwrap()
         };
         let settle = |turns: i64| {
-            let (host, count_turns) = (&host, &count_turns);
+            let (host, count_turns, store) = (&host, &count_turns, &store);
             async move {
-                tokio::time::timeout(Duration::from_secs(15), async {
+                let settled = tokio::time::timeout(Duration::from_secs(15), async {
                     while count_turns() < turns || !host.busy_sessions().await.is_empty() {
                         tokio::task::yield_now().await;
                     }
                 })
-                .await
-                .unwrap();
+                .await;
+                assert!(
+                    settled.is_ok(),
+                    "expected {turns} settled turns, got {}; latest: {:?}; busy: {:?}",
+                    count_turns(),
+                    store.latest_chat_turn("pursuer").unwrap().map(|turn| (
+                        turn.state,
+                        turn.error_kind,
+                        turn.error_message,
+                    )),
+                    host.busy_sessions().await,
+                );
             }
         };
         // Moves the chat's whole history an hour back, past the quiet period.

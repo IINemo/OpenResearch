@@ -22,6 +22,6 @@ test('a goal with a deadline keeps the agent working on its own until it reports
     // Waits out the goal keeper's quiet period.
     await expect(page.getByText('The goal is met: p50 latency fell 52%.')).toBeVisible({ timeout: QUIET_MS + 15_000 })
     await expect(chip).toContainText('Goal met')
-    await expect(page.getByRole('feed', { name: 'Messages' }).getByText('OpenResearch', { exact: true })).toBeVisible()
+    await expect(page.getByRole('feed', { name: 'Messages' }).getByText(/from OpenResearch/)).toBeVisible()
   })
 })
