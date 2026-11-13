@@ -1,6 +1,7 @@
 //! Shared compute settings operations for the dashboard and standalone CLI.
 
 use super::*;
+use std::collections::BTreeMap;
 
 // --- HF token settings ------------------------------------------------------
 
@@ -14,6 +15,9 @@ pub(super) struct HfSettings {
     validation_error: Option<String>,
     username: Option<String>,
     jobs_write: Option<bool>,
+    /// Whether the token can create or read the bucket staging uploads each run's source to.
+    source_staging: Option<bool>,
+    source_staging_error: Option<String>,
 }
 
 /// Never the full token: first 3 chars + ellipsis + last 4.
@@ -42,6 +46,8 @@ pub(super) async fn hf_token_status() -> HfSettings {
             validation_error: None,
             username: None,
             jobs_write: None,
+            source_staging: None,
+            source_staging_error: None,
         };
     };
     let source = match source {
@@ -50,15 +56,28 @@ pub(super) async fn hf_token_status() -> HfSettings {
         TokenSource::HfCache => "hfCache",
     };
     match huggingface::whoami_details(&token).await {
-        Ok(details) => HfSettings {
-            configured: true,
-            source: Some(source),
-            masked_token: Some(mask_token(&token)),
-            validation_status: "valid",
-            validation_error: None,
-            username: Some(details.name),
-            jobs_write: details.jobs_write,
-        },
+        Ok(details) => {
+            let (source_staging, source_staging_error) =
+                match huggingface::can_stage_source(&token, &details.name).await {
+                    Ok(true) => (Some(true), None),
+                    Ok(false) => (
+                        Some(false),
+                        Some(huggingface::staging_forbidden(&details.name)),
+                    ),
+                    Err(error) => (None, Some(error.to_string())),
+                };
+            HfSettings {
+                configured: true,
+                source: Some(source),
+                masked_token: Some(mask_token(&token)),
+                validation_status: "valid",
+                validation_error: None,
+                username: Some(details.name),
+                jobs_write: details.jobs_write,
+                source_staging,
+                source_staging_error,
+            }
+        }
         Err(error) => {
             let validation_status = if error
                 .downcast_ref::<reqwest::Error>()
@@ -76,6 +95,8 @@ pub(super) async fn hf_token_status() -> HfSettings {
                 validation_error: Some(error.to_string()),
                 username: None,
                 jobs_write: None,
+                source_staging: None,
+                source_staging_error: None,
             }
         }
     }
@@ -418,7 +439,7 @@ pub(super) async fn set_k8s_settings(Json(req): Json<SetK8sSettingsReq>) -> ApiR
 /// (wildcard patterns skipped) — read-only groundwork for an SSH compute
 /// backend. No keys are read.
 pub(super) fn list_ssh_hosts() -> Vec<Value> {
-    let Some(home) = dirs::home_dir() else {
+    let Some(home) = crate::config::home_dir() else {
         return Vec::new();
     };
     ssh_hosts_in(&home)
@@ -815,7 +836,7 @@ pub(super) async fn save_ssh_default(Json(req): Json<SaveSshDefaultReq>) -> ApiR
 }
 
 pub(super) fn ssh_config_path() -> Result<std::path::PathBuf> {
-    Ok(dirs::home_dir()
+    Ok(crate::config::home_dir()
         .ok_or_else(|| anyhow!("no home directory"))?
         .join(".ssh")
         .join("config"))
@@ -1008,11 +1029,14 @@ pub(super) fn slurm_settings_json() -> Value {
         "host": settings.host,
         "partition": settings.partition,
         "account": settings.account,
+        "qos": settings.qos,
         "timeLimit": settings.time_limit,
         "cpusPerTask": settings.cpus_per_task,
         "mem": settings.mem,
         "remoteRoot": settings.remote_root,
         "keepRemoteRuns": settings.keep_remote_runs,
+        "sbatchArgs": settings.sbatch_args,
+        "requestOneTask": settings.request_one_task != Some(false),
         "hosts": list_ssh_hosts(),
     })
 }
@@ -1030,19 +1054,73 @@ pub(super) struct SetSlurmSettingsReq {
     host: Option<String>,
     partition: Option<String>,
     account: Option<String>,
+    qos: Option<String>,
     time_limit: Option<String>,
     /// Cores per job. `Some(0)` clears it (partition default).
     cpus_per_task: Option<u32>,
     mem: Option<String>,
     remote_root: Option<String>,
     keep_remote_runs: Option<bool>,
+    /// Replaces the saved list; blank entries are dropped.
+    sbatch_args: Option<Vec<String>>,
+    request_one_task: Option<bool>,
 }
 
-pub(super) async fn set_slurm_settings(Json(req): Json<SetSlurmSettingsReq>) -> ApiResult {
+/// A rejected Slurm save, each message under the field it is about so the form can show it
+/// there; `error` joins them for the CLI and older dashboards.
+#[derive(Debug)]
+pub(super) enum SlurmSaveError {
+    Fields(BTreeMap<&'static str, Vec<String>>),
+    Api(ApiError),
+}
+
+fn joined(fields: &BTreeMap<&'static str, Vec<String>>) -> String {
+    fields
+        .values()
+        .flatten()
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+impl From<SlurmSaveError> for ApiError {
+    fn from(error: SlurmSaveError) -> Self {
+        match error {
+            SlurmSaveError::Fields(fields) => bad_request(joined(&fields)),
+            SlurmSaveError::Api(error) => error,
+        }
+    }
+}
+
+impl From<crate::error::Error> for SlurmSaveError {
+    fn from(error: crate::error::Error) -> Self {
+        Self::Api(error.into())
+    }
+}
+
+impl IntoResponse for SlurmSaveError {
+    fn into_response(self) -> Response {
+        match self {
+            Self::Fields(fields) => {
+                let body = json!({"error": joined(&fields), "fields": fields});
+                (StatusCode::BAD_REQUEST, Json(body)).into_response()
+            }
+            Self::Api(error) => error.into_response(),
+        }
+    }
+}
+
+pub(super) async fn set_slurm_settings(
+    Json(req): Json<SetSlurmSettingsReq>,
+) -> std::result::Result<Json<Value>, SlurmSaveError> {
     // One spawn_blocking around the whole load→mutate→save→respond body
     // (settings + ~/.ssh/config are sync fs I/O), like the git handlers.
     tokio::task::spawn_blocking(move || {
         let mut settings = slurm::load_settings()?.unwrap_or_default();
+        let mut errors: BTreeMap<&'static str, Vec<String>> = BTreeMap::new();
+        let mut reject = |field, error: crate::error::Error| {
+            errors.entry(field).or_default().push(error.to_string())
+        };
         let norm = |v: String| Some(v.trim().to_string()).filter(|s| !s.is_empty());
         if let Some(h) = req.host {
             settings.host = norm(h);
@@ -1053,40 +1131,111 @@ pub(super) async fn set_slurm_settings(Json(req): Json<SetSlurmSettingsReq>) -> 
         if let Some(a) = req.account {
             settings.account = norm(a);
         }
-        if let Some(t) = req.time_limit {
-            // Reject a default that would fail every later launch.
-            let t = norm(t);
-            if let Some(t) = &t {
-                crate::jobs::huggingface::parse_timeout(t).map_err(bad_request)?;
+        // Each check rejects a default that would fail every later launch.
+        if let Some(q) = req.qos {
+            settings.qos = norm(q);
+            if let Some(Err(error)) = settings
+                .qos
+                .as_deref()
+                .map(|q| slurm::parse_value("QoS", q))
+            {
+                reject("qos", error);
             }
-            settings.time_limit = t;
+        }
+        if let Some(t) = req.time_limit {
+            settings.time_limit = norm(t);
+            let parsed = settings
+                .time_limit
+                .as_deref()
+                .map(crate::jobs::huggingface::parse_timeout);
+            if let Some(Err(error)) = parsed {
+                reject("timeLimit", error);
+            }
         }
         if let Some(c) = req.cpus_per_task {
             settings.cpus_per_task = Some(c).filter(|c| *c > 0);
         }
         if let Some(m) = req.mem {
-            // Reject a default that would fail every later launch.
-            let m = norm(m);
-            settings.mem = match m {
-                Some(m) => Some(slurm::parse_mem(&m).map_err(bad_request)?),
-                None => None,
+            settings.mem = match norm(m).map(|m| slurm::parse_mem(&m)).transpose() {
+                Ok(mem) => mem,
+                Err(error) => {
+                    reject("mem", error);
+                    None
+                }
             };
         }
         if let Some(root) = req.remote_root {
-            let root = norm(root);
-            if let Some(root) = &root {
-                crate::jobs::ssh::validate_remote_root(root).map_err(bad_request)?;
+            settings.remote_root = norm(root);
+            if let Some(Err(error)) = settings
+                .remote_root
+                .as_deref()
+                .map(crate::jobs::ssh::validate_remote_root)
+            {
+                reject("remoteRoot", error);
             }
-            settings.remote_root = root;
         }
         if let Some(keep) = req.keep_remote_runs {
             settings.keep_remote_runs = keep;
+        }
+        if let Some(one_task) = req.request_one_task {
+            settings.request_one_task = (!one_task).then_some(false);
+        }
+        if let Some(args) = req.sbatch_args {
+            settings.sbatch_args = args
+                .iter()
+                .filter(|arg| !arg.trim().is_empty())
+                .filter_map(|arg| {
+                    slurm::parse_sbatch_arg(arg)
+                        .map_err(|e| reject("sbatchArgs", e))
+                        .ok()
+                })
+                .collect();
+        }
+
+        let written = [
+            (
+                "ntasks",
+                settings.request_one_task != Some(false),
+                "Request one task",
+            ),
+            ("time", settings.time_limit.is_some(), "Time limit"),
+            ("partition", settings.partition.is_some(), "Partition"),
+            ("account", settings.account.is_some(), "Account"),
+            ("qos", settings.qos.is_some(), "QoS"),
+            (
+                "cpus-per-task",
+                settings.cpus_per_task.is_some(),
+                "CPUs per job",
+            ),
+            ("mem", settings.mem.is_some(), "Memory"),
+        ];
+        let written_lines = written
+            .iter()
+            .filter(|(_, set, _)| *set)
+            .map(|(line, ..)| *line);
+        for arg in &settings.sbatch_args {
+            let Some(line) = slurm::repeated_line(arg, written_lines.clone()) else {
+                continue;
+            };
+            let (.., field) = written.iter().find(|(name, ..)| *name == line).unwrap();
+            let fix = if line == "ntasks" {
+                format!(
+                    "which OpenResearch sets to 1 while {field} is on. Turn it off to use your own"
+                )
+            } else {
+                format!("which {field} already sets. Remove that line or clear {field}")
+            };
+            reject("sbatchArgs", anyhow!("{arg} sets --{line}, {fix}."));
+        }
+
+        if !errors.is_empty() {
+            return Err(SlurmSaveError::Fields(errors));
         }
         slurm::save_settings(&settings)?;
         Ok(Json(slurm_settings_json()))
     })
     .await
-    .map_err(|e| ApiError::from(anyhow!("slurm task failed: {e}")))?
+    .map_err(|e| SlurmSaveError::from(anyhow!("slurm task failed: {e}")))?
 }
 
 #[derive(Deserialize)]
@@ -1248,7 +1397,7 @@ pub(super) async fn openresearch_ssh_readiness() -> SshReadiness {
         return SshReadiness::NoUsableKey;
     };
     match crate::local::ssh_identity::check(&creds).await {
-        KeyStatus::Matched => SshReadiness::Ready,
+        KeyStatus::Matched { .. } => SshReadiness::Ready,
         KeyStatus::NoLocalMatch { .. } | KeyStatus::NoneRegistered { .. } => {
             SshReadiness::NoUsableKey
         }
@@ -1525,7 +1674,7 @@ pub(super) async fn openresearch_settings() -> ApiResult {
             .map(tilde);
     };
     let ssh_key_status = match crate::local::ssh_identity::check(&creds).await {
-        KeyStatus::Matched => "matched",
+        KeyStatus::Matched { .. } => "matched",
         KeyStatus::NoLocalMatch { local, .. } => {
             note_key(&local);
             "no_local_match"
@@ -1724,7 +1873,9 @@ pub(crate) async fn configure(backend: &str, body: Value) -> Result<Value> {
             }
             ssh_settings().await
         }
-        "slurm" => set_slurm_settings(Json(serde_json::from_value(body)?)).await,
+        "slurm" => set_slurm_settings(Json(serde_json::from_value(body)?))
+            .await
+            .map_err(ApiError::from),
         "ray" => set_ray_settings(Json(serde_json::from_value(body)?)).await,
         "k8s" => set_k8s_settings(Json(serde_json::from_value(body)?)).await,
         "hf" => set_hf_token(Json(serde_json::from_value(body)?)).await,
@@ -1744,6 +1895,7 @@ pub(crate) async fn check(
     container: Option<String>,
     no_container: bool,
     address: Option<String>,
+    caller_python_overrides: &std::collections::BTreeMap<String, String>,
 ) -> Result<Value> {
     let mut value = match backend {
         "ssh" => {
@@ -1765,11 +1917,11 @@ pub(crate) async fn check(
             cli_result(slurm_preflight(Json(SlurmPreflightReq { host })).await)?
         }
         "ray" => cli_result(ray_preflight(Json(RayPreflightReq { address })).await)?,
-        "modal" => match modal::preflight().await {
+        "modal" => match modal::preflight(caller_python_overrides).await {
             Ok(()) => json!({"ready": true}),
             Err(error) => json!({"ready": false, "error": error.to_string()}),
         },
-        "vercel" => match vercel::preflight().await {
+        "vercel" => match vercel::preflight(caller_python_overrides).await {
             Ok(()) => json!({"ready": true}),
             Err(error) => json!({"ready": false, "error": error.to_string()}),
         },
@@ -1789,9 +1941,15 @@ pub(crate) async fn check(
         }
         "ray" => value["reachable"] == true,
         "k8s" => {
-            value["preflight"]["reachable"] == true && value["preflight"]["canCreateJobs"] == true
+            value["preflight"]["reachable"] == true
+                && value["preflight"]["canCreateJobs"] == true
+                && value["preflight"]["canPatchJobs"] == true
         }
-        "hf" => value["validationStatus"] == "valid" && value["jobsWrite"] != false,
+        "hf" => {
+            value["validationStatus"] == "valid"
+                && value["jobsWrite"] != false
+                && value["sourceStaging"] == true
+        }
         "tinker" => value["validationStatus"] == "valid",
         "openresearch" => {
             value["loggedIn"] == true
@@ -1868,6 +2026,94 @@ mod tests {
                 serde_json::from_slice(&std::fs::read(dir.join(file)).unwrap()).unwrap();
             assert_eq!(saved["fieldFromANewerOrx"], newer, "{file}");
         }
+    }
+
+    #[tokio::test]
+    async fn slurm_launch_options_save_over_a_shipped_settings_file() {
+        if !crate::config::in_test_child(&[]) {
+            return;
+        }
+        let shipped: Vec<Value> =
+            serde_json::from_str(include_str!("../../../tests/contracts/slurm-settings.json"))
+                .unwrap();
+        let dir = crate::config::config_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("slurm.json"), shipped[0].to_string()).unwrap();
+        let save = |body: Value| set_slurm_settings(Json(serde_json::from_value(body).unwrap()));
+
+        let Json(saved) = save(json!({
+            "qos": " acc_ehpc ",
+            "sbatchArgs": ["--rsc p=1:g=1", " ", "#SBATCH --mail-type=END"],
+            "requestOneTask": false,
+        }))
+        .await
+        .unwrap();
+        assert_eq!(saved["qos"], "acc_ehpc");
+        assert_eq!(
+            saved["sbatchArgs"],
+            json!(["--rsc p=1:g=1", "--mail-type=END"])
+        );
+        assert_eq!(saved["requestOneTask"], false);
+        assert_eq!(saved["partition"], "gpu");
+        assert_eq!(saved["cpusPerTask"], 16);
+
+        // Every line that would fail every launch is named under its field.
+        let Err(SlurmSaveError::Fields(fields)) = save(json!({
+            "qos": "a b",
+            "timeLimit": "soon",
+            "sbatchArgs": ["--output=/scratch/me/log", "-p debug", "--rsc g=1", "--mem=8G"],
+            "requestOneTask": true,
+        }))
+        .await
+        else {
+            panic!("expected field errors");
+        };
+        assert_eq!(
+            fields.keys().copied().collect::<Vec<_>>(),
+            ["qos", "sbatchArgs", "timeLimit"]
+        );
+        let sbatch = fields["sbatchArgs"].join("\n");
+        assert!(
+            sbatch.contains("--output=/scratch/me/log sets --output"),
+            "{sbatch}"
+        );
+        assert!(
+            sbatch.contains("-p debug sets --partition, which Partition"),
+            "{sbatch}"
+        );
+        assert!(
+            sbatch.contains("--mem=8G sets --mem, which Memory"),
+            "{sbatch}"
+        );
+        assert!(
+            !sbatch.contains("--rsc") && !sbatch.contains('"'),
+            "{sbatch}"
+        );
+        let Err(SlurmSaveError::Fields(fields)) =
+            save(json!({"sbatchArgs": ["--ntasks=4"], "requestOneTask": true})).await
+        else {
+            panic!("expected field errors");
+        };
+        assert!(
+            fields["sbatchArgs"][0].contains("Request one task"),
+            "{fields:?}"
+        );
+        assert_eq!(
+            slurm::load_settings().unwrap().unwrap().request_one_task,
+            Some(false)
+        );
+
+        let Json(cleared) = save(json!({"qos": "", "sbatchArgs": [], "requestOneTask": true}))
+            .await
+            .unwrap();
+        assert_eq!(cleared["qos"], Value::Null);
+        assert_eq!(cleared["sbatchArgs"], json!([]));
+        assert_eq!(cleared["requestOneTask"], true);
+        let rewritten: Value =
+            serde_json::from_str(&std::fs::read_to_string(dir.join("slurm.json")).unwrap())
+                .unwrap();
+        assert_eq!(rewritten.get("requestOneTask"), None);
+        assert_eq!(rewritten["account"], "lab");
     }
 
     #[test]
@@ -2140,6 +2386,16 @@ Host b
         assert_eq!(hosts[0]["host"], "depth-0");
         assert_eq!(hosts.last().unwrap()["host"], "depth-14");
     }
+
+    #[test]
+    fn the_ssh_config_resolves_inside_the_test_home_whatever_home_is() {
+        let path = ssh_config_path().unwrap();
+        assert!(
+            path.starts_with(crate::config::test_home()),
+            "{}",
+            path.display()
+        );
+    }
 }
 
 #[cfg(test)]
@@ -2180,6 +2436,75 @@ mod account_tests {
         assert_eq!(
             account_response(Some(creds("valid"))).await.unwrap().0["failure"]["kind"],
             "offline"
+        );
+    }
+}
+
+#[cfg(test)]
+mod hf_readiness_tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    /// `compute test hf` is ready only when the token can do what staging does first.
+    #[tokio::test]
+    async fn hf_readiness_requires_the_source_bucket() {
+        if !crate::config::in_test_child(&["HF_TOKEN", "HF_ENDPOINT"]) {
+            return;
+        }
+        let bucket = Arc::new(Mutex::new((200u16, 200u16)));
+        let (create, info) = (bucket.clone(), bucket.clone());
+        let upstream = Router::new()
+            .route(
+                "/api/whoami-v2",
+                get(|| async {
+                    Json(json!({"name": "ada", "auth": {"accessToken": {"role": "write"}}}))
+                }),
+            )
+            .route(
+                "/api/buckets/ada/jobs-artifacts",
+                axum::routing::post(move || async move {
+                    StatusCode::from_u16(create.lock().unwrap().0).unwrap()
+                })
+                .get(move || async move { StatusCode::from_u16(info.lock().unwrap().1).unwrap() }),
+            );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        std::env::set_var(
+            "HF_ENDPOINT",
+            format!("http://{}", listener.local_addr().unwrap()),
+        );
+        std::env::set_var("HF_TOKEN", "hf_fake");
+        tokio::spawn(async move { axum::serve(listener, upstream).await.unwrap() });
+        let none = Default::default();
+        let test = || check("hf", None, None, false, None, &none);
+
+        for (statuses, ready) in [
+            ((200, 200), true),
+            ((409, 200), true),
+            ((403, 200), true),
+            ((403, 404), false),
+            ((401, 403), false),
+        ] {
+            *bucket.lock().unwrap() = statuses;
+            let value = test().await.unwrap();
+            assert_eq!(value["ready"], ready, "{statuses:?}: {value}");
+            assert_eq!(value["sourceStaging"], ready, "{statuses:?}: {value}");
+            if !ready {
+                let error = value["sourceStagingError"].as_str().unwrap();
+                assert!(error.contains("ada/jobs-artifacts"), "{error}");
+                assert!(error.contains("huggingface.co/settings/tokens"), "{error}");
+            }
+        }
+
+        *bucket.lock().unwrap() = (503, 200);
+        let value = test().await.unwrap();
+        assert_eq!(value["ready"], false, "{value}");
+        assert!(value["sourceStaging"].is_null(), "{value}");
+        assert!(
+            value["sourceStagingError"]
+                .as_str()
+                .unwrap()
+                .contains("503"),
+            "{value}"
         );
     }
 }

@@ -5,7 +5,6 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use orx_host_proto::{LogTarget, Request, Response};
-use sha2::{Digest, Sha256};
 
 use super::ssh::Ssh;
 use crate::engine::*;
@@ -56,26 +55,6 @@ impl LegacyTransport {
             _ => Err(anyhow!("Unexpected Exec response")),
         }
     }
-
-    pub async fn upload(&self, command: &str, source: &Path) -> Result<String> {
-        let mut hash = Sha256::new();
-        let mut file = std::fs::File::open(source)?;
-        std::io::copy(&mut file, &mut hash)?;
-        let sha = format!("{:x}", hash.finalize());
-        self.ssh
-            .stage_blob(&sha, source, file.metadata()?.len())
-            .await
-            .map_err(|error| anyhow!("Source upload failed: {error:?}"))?;
-        let blob = format!("{}/sources/{sha}", self.ssh.root);
-        self.execute(
-            &format!(
-                "{{ {command}; }} < {}",
-                ssh::shell_path(blob.strip_prefix("~/").unwrap_or(&blob))
-            ),
-            &[],
-        )
-        .await
-    }
 }
 
 fn descriptor(handle: &Handle) -> Result<&BackendDescriptor> {
@@ -89,11 +68,55 @@ fn descriptor(handle: &Handle) -> Result<&BackendDescriptor> {
     }
 }
 
-async fn rental_deleted(descriptor: &BackendDescriptor) -> Result<bool> {
-    let Some(creds) = crate::config::load_credentials().await? else {
-        return Ok(false);
+/// The box as OpenResearch reports it; `None` once it is deleted.
+async fn lookup(descriptor: &BackendDescriptor) -> Result<Option<crate::client::Sandbox>> {
+    let (org, id) = descriptor.openresearch_ref()?;
+    let creds = crate::config::load_credentials()
+        .await?
+        .ok_or_else(|| anyhow!("Missing OpenResearch credentials"))?;
+    let lookup = async {
+        match crate::client::get_sandbox(&creds, id).await {
+            Ok(envelope) => Ok(Some(envelope.sandbox)),
+            Err(error) if crate::jobs::openresearch::is_not_found_error(&error.to_string()) => {
+                crate::jobs::openresearch::confirm_gone(&creds, org, id)
+                    .await
+                    .map(|()| None)
+            }
+            Err(error) => Err(error),
+        }
     };
-    Ok(crate::jobs::openresearch::box_deleted(&creds, descriptor.openresearch_ref()?.1).await)
+    tokio::time::timeout(Duration::from_secs(15), lookup)
+        .await
+        .map_err(|_| anyhow!("OpenResearch did not answer about box {id} within 15 s"))?
+}
+
+async fn rental_deleted(descriptor: &BackendDescriptor) -> bool {
+    matches!(lookup(descriptor).await, Ok(None))
+}
+
+/// What OpenResearch says went wrong with a box that is `failed`, `offline` or `dead`.
+fn box_failure(sandbox: &crate::client::Sandbox) -> Option<String> {
+    match sandbox.status.as_str() {
+        "failed" => Some(format!(
+            "{}: {}",
+            sandbox.failure_code.as_deref().unwrap_or("provider_error"),
+            sandbox
+                .failure_message
+                .as_deref()
+                .unwrap_or("The provider could not provision this box.")
+        )),
+        "offline" | "dead" => Some(format!(
+            "box {} went {}{}",
+            sandbox.id,
+            sandbox.status,
+            sandbox
+                .provision_warnings
+                .as_deref()
+                .map(|warnings| format!(": {warnings}"))
+                .unwrap_or_default()
+        )),
+        _ => None,
+    }
 }
 
 fn kept_page(
@@ -220,26 +243,45 @@ const MAX_ACTIVE_SECONDS: u64 = 7 * 24 * 3600;
 
 const REJECTED_KEY_GRACE_MS: i64 = 15 * 60 * 1000;
 
-fn rejected_key_expired(
-    created_at: i64,
+enum Refusal {
+    /// The engine launches only over a live connection, so a run that never reached its box
+    /// never started.
+    Unreached,
+    /// A box reachable during this run has rejected its key for the grace period.
+    Expired,
+}
+
+fn refusal(
+    run: &StoredRun,
     contact: &crate::store::Contact,
     host: &crate::engine::transport::HostState,
     now: i64,
-) -> bool {
+) -> Option<Refusal> {
     let crate::store::Contact::NeedsAuth { since, .. } = contact else {
-        return false;
+        return None;
     };
-    let cause = host
-        .cause
-        .as_deref()
-        .unwrap_or_default()
-        .to_ascii_lowercase();
-    host.status == crate::engine::transport::Status::NeedsAuth
-        && cause.contains("permission denied (publickey)")
-        && host
-            .last_live_ms
-            .is_some_and(|live| live >= created_at && live <= host.since_ms)
-        && now.saturating_sub(host.since_ms.max(*since)) >= REJECTED_KEY_GRACE_MS
+    if host.status != crate::engine::transport::Status::NeedsAuth
+        || !host
+            .cause
+            .as_deref()
+            .is_some_and(crate::engine::transport::key_refused)
+    {
+        return None;
+    }
+    if unreached(run, host) {
+        return Some(Refusal::Unreached);
+    }
+    let reachable = host
+        .last_live_ms
+        .is_some_and(|live| live >= run.created_at && live <= host.since_ms);
+    (reachable && now.saturating_sub(host.since_ms.max(*since)) >= REJECTED_KEY_GRACE_MS)
+        .then_some(Refusal::Expired)
+}
+
+/// An engine launch whose box was never live during the run, so its payload never started.
+fn unreached(run: &StoredRun, host: &crate::engine::transport::HostState) -> bool {
+    matches!(handle_of(run), Some(Handle::OpenResearch { .. }))
+        && host.last_live_ms.is_none_or(|live| live < run.created_at)
 }
 
 impl OpenResearch {
@@ -256,7 +298,7 @@ impl OpenResearch {
             match rental.operation("release").await {
                 Ok(()) => return Ok(()),
                 Err(error) => {
-                    if rental_deleted(descriptor).await? {
+                    if rental_deleted(descriptor).await {
                         return Ok(());
                     }
                     return Err(error);
@@ -266,7 +308,8 @@ impl OpenResearch {
         let creds = crate::config::load_credentials()
             .await?
             .ok_or_else(|| anyhow!("Missing OpenResearch credentials"))?;
-        crate::jobs::openresearch::teardown(&creds, descriptor.openresearch_ref()?.1).await
+        let (org, id) = descriptor.openresearch_ref()?;
+        crate::jobs::openresearch::teardown(&creds, org, id).await
     }
 
     async fn inspect(
@@ -281,7 +324,7 @@ impl OpenResearch {
         let mut descriptor =
             descriptor(&handle_of(&stored).ok_or_else(|| anyhow!("Missing box handle"))?)?.clone();
         if self
-            .cancel_rejected_key(&stored, &state.contact, &descriptor)
+            .end_rejected_key(&stored, &state.contact, &descriptor)
             .await?
         {
             return Ok(Vec::new());
@@ -289,15 +332,15 @@ impl OpenResearch {
         let Some(_gate) = self.engine.try_gate(&watched.id) else {
             return Ok(Vec::new());
         };
+        let age = Duration::from_millis(
+            self.engine
+                .clock
+                .wall_ms()
+                .saturating_sub(stored.created_at)
+                .max(0)
+                .unsigned_abs(),
+        );
         {
-            let age = Duration::from_millis(
-                self.engine
-                    .clock
-                    .wall_ms()
-                    .saturating_sub(stored.created_at)
-                    .max(0)
-                    .unsigned_abs(),
-            );
             let remaining = crate::engine::runtime::PREPARATION_BUDGET.saturating_sub(age);
             let mut bootstrap = self.bootstrap.lock().await;
             if matches!(watched.handle, Handle::OpenResearch { .. })
@@ -329,44 +372,42 @@ impl OpenResearch {
             )]);
         }
         if descriptor.openresearch_ssh_target().is_none() {
-            let creds = crate::config::load_credentials()
-                .await?
-                .ok_or_else(|| anyhow!("Missing OpenResearch credentials"))?;
-            let sandbox = match crate::client::get_sandbox(&creds, descriptor.openresearch_ref()?.1)
-                .await
-            {
-                Ok(envelope) => envelope.sandbox,
-                Err(error) if crate::jobs::openresearch::is_not_found_error(&error.to_string()) => {
-                    return Ok(vec![(
-                        watched.id.clone(),
-                        Observation::Gone {
-                            reason: crate::plane::LABELS["run_notice_rental_outcome_unavailable"]
-                                .clone(),
-                        },
-                    )]);
-                }
-                Err(error) => return Err(error),
-            };
-            if sandbox.status == "failed" {
-                return Ok(vec![(
+            let id = descriptor.openresearch_ref()?.1.to_owned();
+            let failed = |reason: String| {
+                Ok(vec![(
                     watched.id.clone(),
                     Observation::Failed {
                         finished_at: None,
-                        reason: sandbox
-                            .failure_message
-                            .unwrap_or_else(|| "Box provisioning failed".into()),
+                        reason: format!("Provisioning failed: {reason}"),
                     },
-                )]);
+                )])
+            };
+            let Some(sandbox) = lookup(&descriptor).await? else {
+                return failed(format!(
+                    "box {id} was deleted before it came online, and OpenResearch kept no reason."
+                ));
+            };
+            if let Some(failure) = box_failure(&sandbox) {
+                return failed(failure);
             }
             if sandbox.status != "online"
                 || sandbox.ssh_hostname.is_none()
                 || sandbox.ssh_port.is_none()
                 || sandbox.ssh_username.is_none()
             {
+                // Ends on release proof; a timer alone never makes a run terminal.
+                if age >= crate::engine::runtime::PREPARATION_BUDGET {
+                    self.release(&descriptor).await?;
+                    return failed(format!(
+                        "box {id} was still {} after {} minutes, so orx released it.",
+                        sandbox.status,
+                        crate::engine::runtime::PREPARATION_BUDGET.as_secs() / 60
+                    ));
+                }
                 return Ok(vec![(
                     watched.id.clone(),
                     Observation::Queued {
-                        detail: "Provisioning box".into(),
+                        detail: Some("Provisioning box".into()),
                     },
                 )]);
             }
@@ -406,9 +447,17 @@ impl OpenResearch {
                         }
                     } else if inspection.alive {
                         Observation::Running { started_at: None }
+                    } else if inspection.pid.is_some() || inspection.receipt_unreadable {
+                        Observation::Unreconciled {
+                            detail: "Legacy process gone without a receipt".into(),
+                        }
                     } else {
-                        Observation::Queued {
-                            detail: "Waiting for the rental supervisor".into(),
+                        // Adoption means the 0.2 supervisor that would start the payload is gone.
+                        Observation::Unreconciled {
+                            detail: format!(
+                                "orx 0.2 stopped before starting this run on its box. Run `orx exp abandon {}` to release the box.",
+                                watched.id
+                            ),
                         }
                     };
                     Ok(vec![(watched.id.clone(), observation)])
@@ -452,7 +501,7 @@ impl OpenResearch {
                         .map_or(true, |(_, state)| state.cancel_accepted_at.is_some())
                 })
                 .await
-                .map_err(|error| anyhow!("Box staging: {error:?}"))?;
+                .map_err(|error| anyhow!("Box staging: {error}"))?;
             let rental = descriptor
                 .rental_lease
                 .as_ref()
@@ -491,14 +540,16 @@ impl OpenResearch {
             summary.state,
             orx_host_proto::RunState::Missing
                 | orx_host_proto::RunState::Staging
-                | orx_host_proto::RunState::Starting
+                | orx_host_proto::RunState::Starting { .. }
         ) {
             self.bootstrap.lock().await.take();
         }
         Ok(super::ssh::observations(watched.id.clone(), &summary))
     }
 
-    async fn cancel_rejected_key(
+    /// Ends a run whose box keeps refusing its SSH key: at once when the run never reached the
+    /// box, else by Cancel after the grace.
+    async fn end_rejected_key(
         &self,
         run: &StoredRun,
         contact: &crate::store::Contact,
@@ -512,56 +563,128 @@ impl OpenResearch {
             return Ok(false);
         };
         let host = transport.ssh.conn.state().borrow().clone();
-        if !rejected_key_expired(run.created_at, contact, &host, self.engine.clock.wall_ms()) {
+        if refusal(run, contact, &host, self.engine.clock.wall_ms()).is_none() {
             return Ok(false);
         }
 
         let Some(_gate) = self.engine.try_gate(&run.id) else {
             return Ok(true);
         };
-        let (_, sandbox) = descriptor.openresearch_ref()?;
-        let creds = crate::config::load_credentials()
-            .await?
-            .ok_or_else(|| anyhow!("Missing OpenResearch credentials"))?;
-        let released = match crate::client::get_sandbox(&creds, sandbox).await {
-            Ok(_) => false,
-            Err(error) if crate::jobs::openresearch::is_not_found_error(&error.to_string()) => true,
-            Err(error) => return Err(error),
-        };
+        let sandbox = lookup(descriptor).await?;
 
         let (current, state) = self.engine.load(&run.id)?;
         let host = transport.ssh.conn.state().borrow().clone();
         if current.cancel_requested
             || state.cancel_accepted_at.is_some()
             || phase_of(&current)?.is_terminal()
-            || !rejected_key_expired(
-                current.created_at,
-                &state.contact,
-                &host,
-                self.engine.clock.wall_ms(),
-            )
         {
             return Ok(true);
         }
+        let Some(refusal) = refusal(&current, &state.contact, &host, self.engine.clock.wall_ms())
+        else {
+            return Ok(true);
+        };
 
-        if released {
-            self.engine.observe(
+        match refusal {
+            Refusal::Unreached => {
+                if sandbox.is_some() {
+                    self.release(descriptor).await?;
+                }
+                let failure = sandbox.as_ref().and_then(box_failure);
+                let reason = self.unreached_reason(descriptor, &host, failure).await?;
+                self.engine.observe(
+                    &run.id,
+                    Observation::Failed {
+                        finished_at: None,
+                        reason,
+                    },
+                )?;
+            }
+            Refusal::Expired if sandbox.is_none() => self.engine.observe(
                 &run.id,
                 Observation::Gone {
                     reason: crate::plane::LABELS["run_notice_rental_outcome_unavailable"].clone(),
                 },
-            )?;
-        } else {
-            self.engine
-                .cancel(
-                    self,
-                    &run.id,
-                    &crate::plane::LABELS["run_notice_rental_key_cancelled"],
-                )
-                .await?;
+            )?,
+            Refusal::Expired => {
+                self.engine
+                    .cancel(
+                        self,
+                        &run.id,
+                        &crate::plane::LABELS["run_notice_rental_key_cancelled"],
+                    )
+                    .await?;
+            }
         }
 
         Ok(true)
+    }
+
+    /// Why a run that never reached its box ended, with what OpenResearch says went wrong with
+    /// the box, if anything.
+    async fn unreached_reason(
+        &self,
+        descriptor: &BackendDescriptor,
+        host: &crate::engine::transport::HostState,
+        failure: Option<String>,
+    ) -> Result<String> {
+        let id = descriptor.openresearch_ref()?.1;
+        let cause = host
+            .cause
+            .as_deref()
+            .unwrap_or("no connection was attempted");
+        let reason = if crate::engine::transport::key_refused(cause) {
+            let creds = crate::config::load_credentials()
+                .await?
+                .ok_or_else(|| anyhow!("Missing OpenResearch credentials"))?;
+            crate::local::ssh_identity::explain_refusal(&creds, id).await
+        } else {
+            format!("Box {id} was released before orx could reach it: {cause}")
+        };
+        Ok(match failure {
+            Some(failure) => format!("{reason} (OpenResearch reports {failure})"),
+            None => reason,
+        })
+    }
+
+    /// Ends a run whose box can't be inspected once OpenResearch has deleted the box or reports
+    /// it failed or dead. `None` while the box may still be alive.
+    async fn ended(&self, watched: &WatchedRun) -> Result<Option<Observation>> {
+        let descriptor = descriptor(&watched.handle)?;
+        let (run, _) = self.engine.load(&watched.id)?;
+        let unreached_host = descriptor
+            .openresearch_ssh_target()
+            .and_then(|target| (self.transport)(&target).ok())
+            .map(|transport| transport.ssh.conn.state().borrow().clone())
+            .filter(|host| unreached(&run, host));
+
+        // An offline box may come back, unless nothing was ever launched on it.
+        let failure = match lookup(descriptor).await? {
+            None => None,
+            Some(sandbox)
+                if matches!(sandbox.status.as_str(), "failed" | "dead")
+                    || (sandbox.status == "offline" && unreached_host.is_some()) =>
+            {
+                box_failure(&sandbox)
+            }
+            Some(_) => return Ok(None),
+        };
+        if failure.is_some() {
+            self.release(descriptor).await?;
+        }
+
+        if let Some(host) = unreached_host {
+            return Ok(Some(Observation::Failed {
+                finished_at: None,
+                reason: self.unreached_reason(descriptor, &host, failure).await?,
+            }));
+        }
+        Ok(Some(Observation::Gone {
+            reason: failure.map_or_else(
+                || crate::plane::LABELS["run_notice_rental_outcome_unavailable"].clone(),
+                |failure| format!("Outcome unavailable: {failure}"),
+            ),
+        }))
     }
 }
 
@@ -610,8 +733,10 @@ impl Backend for OpenResearch {
         )
         .await
         .map_err(|error| {
-            // A 4xx answer to the create request proves no box exists.
-            if error.to_string().contains(" failed (4") {
+            let refused = error
+                .downcast_ref::<crate::client::ApiResponseError>()
+                .is_some_and(|response| super::api::refuses(response.0));
+            if refused {
                 super::api::rejected(crate::local::openresearch::billing_friendly(error))
             } else {
                 super::api::interrupted(error)
@@ -622,7 +747,13 @@ impl Backend for OpenResearch {
         descriptor.timeout_secs = Some(timeout);
         let lease = match created.rental_lease.filter(|lease| lease.version == 1) {
             Some(lease) => lease,
-            None => match crate::jobs::openresearch::teardown(&creds, &created.sandbox.id).await {
+            None => match crate::jobs::openresearch::teardown(
+                &creds,
+                &created.sandbox.organization_id,
+                &created.sandbox.id,
+            )
+            .await
+            {
                 Ok(()) => {
                     return Err(super::api::rejected(
                         "OpenResearch returned no supported rental lease; the box was deleted",
@@ -663,17 +794,28 @@ impl Backend for OpenResearch {
                 Ok(mut changes) => observations.append(&mut changes),
                 Err(error) => {
                     self.bootstrap.lock().await.take();
-                    if let Ok(descriptor) = descriptor(&watched.handle) {
-                        if rental_deleted(descriptor).await.unwrap_or(false) {
-                            observations.push((
-                                watched.id.clone(),
-                                Observation::Gone {
-                                    reason: crate::plane::LABELS
-                                        ["run_notice_rental_outcome_unavailable"]
-                                        .clone(),
-                                },
-                            ));
+                    match self.ended(watched).await {
+                        Ok(Some(observation)) => {
+                            observations.push((watched.id.clone(), observation));
                             continue;
+                        }
+                        Ok(None) => {}
+                        Err(lookup) => {
+                            if let Some(account) =
+                                lookup.downcast_ref::<crate::jobs::openresearch::OtherAccount>()
+                            {
+                                observations.push((
+                                    watched.id.clone(),
+                                    Observation::NeedsAuth {
+                                        cause: account.to_string(),
+                                    },
+                                ));
+                                continue;
+                            }
+                            eprintln!(
+                                "Run {}: could not check its box with OpenResearch: {lookup:#}",
+                                watched.id
+                            );
                         }
                     }
                     let observation = descriptor(&watched.handle)
@@ -813,7 +955,7 @@ impl Backend for OpenResearch {
         match page {
             Ok(page) => Ok(page),
             Err(error) => {
-                let gone = released || rental_deleted(descriptor).await?;
+                let gone = released || rental_deleted(descriptor).await;
                 if !gone {
                     return Err(error);
                 }
@@ -1051,6 +1193,42 @@ mod tests {
         use crate::engine::transport::{HostState, Status};
         use crate::store::Contact;
 
+        let run = |engine_launched: bool| {
+            let descriptor = BackendDescriptor::parse(
+                r#"{"kind":"openresearch_job","namespace":"org","jobId":"box"}"#,
+            )
+            .unwrap();
+            let handle = if engine_launched {
+                Handle::OpenResearch {
+                    descriptor: Box::new(descriptor.clone()),
+                }
+            } else {
+                Handle::Legacy {
+                    descriptor: Box::new(descriptor.clone()),
+                }
+            };
+            StoredRun {
+                id: "run".into(),
+                experiment_id: "exp".into(),
+                project_id: "proj".into(),
+                status: "starting".into(),
+                backend_json: handle::backend_json("run", Some(&handle), &descriptor).unwrap(),
+                command: "true".into(),
+                created_at: 100,
+                updated_at: 100,
+                ended_at: None,
+                exit_code: None,
+                commit_sha: None,
+                result_markdown: None,
+                cancel_requested: false,
+                cancel_reason: None,
+                chat_session_id: None,
+            }
+        };
+        let legacy = run(false);
+        let rejected_key_expired = |_: i64, contact: &Contact, host: &HostState, now: i64| {
+            matches!(refusal(&legacy, contact, host, now), Some(Refusal::Expired))
+        };
         let created_at = 100;
         let contact = Contact::NeedsAuth {
             since: 200,
@@ -1184,6 +1362,42 @@ mod tests {
             &recovered_at_fourteen,
             &host,
             200 + 15 * 60_000
+        ));
+
+        let launched = run(true);
+        for last_live_ms in [None, Some(99)] {
+            let unreached = HostState {
+                last_live_ms,
+                ..host.clone()
+            };
+            assert!(matches!(
+                refusal(&launched, &contact, &unreached, 200),
+                Some(Refusal::Unreached)
+            ));
+            for (contact, host) in [
+                (
+                    contact.clone(),
+                    HostState {
+                        status: Status::Backoff,
+                        ..unreached.clone()
+                    },
+                ),
+                (
+                    contact.clone(),
+                    HostState {
+                        cause: Some("Connection refused".into()),
+                        ..unreached.clone()
+                    },
+                ),
+                (Contact::Live, unreached.clone()),
+            ] {
+                assert!(refusal(&launched, &contact, &host, 200).is_none());
+            }
+        }
+        assert!(refusal(&launched, &contact, &host, 200 + 14 * 60_000).is_none());
+        assert!(matches!(
+            refusal(&launched, &contact, &host, 200 + 15 * 60_000),
+            Some(Refusal::Expired)
         ));
     }
 }

@@ -40,7 +40,6 @@ const settingsFamilies: Record<string, readonly string[]> = {
   "lit-sources": ["getLitSources"],
   projects: ["getProjectDefaults", "getProjectGitStatus"],
   telemetry: ["getTelemetry"],
-  "run-engine": ["getRunEngine", "listEngineHosts"],
 };
 export function createInvalidation(client: WorkspaceClient) {
   const {
@@ -127,13 +126,14 @@ export function createInvalidation(client: WorkspaceClient) {
     const setting = /^\/api\/settings\/([^/]+)/.exec(path)?.[1];
     if (setting) { invalidate(settingsFamilies[setting] ?? [], scope); return; }
     if (path.startsWith("/api/local-models") && !/\/(discover|check)$/.test(path)) { invalidate(["getLocalModels", "getHarnesses"], scope); return; }
+    if (path.startsWith("/api/opencode/providers")) { invalidate(["getOpenCodeProviders", "getHarnesses"], scope); return; }
+    if (path.startsWith("/api/agent-profiles")) { invalidate(["getHarnesses"], scope); return; }
     if (path === "/api/user-skills" || /^\/api\/user-skills\/[^/]+$/.test(path)) { invalidate(["listUserSkills", "getSkills", "getSkillContent"], scope); return; }
     if (path === "/api/latex-templates") { invalidate(["listLatexTemplates"], scope); return; }
     if (path === "/api/overleaf/token") { invalidate(["getOverleafSettings", "getOverleafState", "getOverleafStatus"], scope); return; }
     if (path.startsWith("/api/update/")) { invalidate(["getUpdateStatus", "getLocalMachine"], scope); return; }
     if (path.startsWith("/api/remote/") || path.startsWith("/_orx/")) {
-      invalidate(["listRemoteSessions"], scope);
-      void queryClient.invalidateQueries({ queryKey: ["gateway", "runtime"] });
+      invalidate(["listRemoteSessions", "getRuntime"], scope);
       return;
     }
     if (path.startsWith("/api/chat/")) {

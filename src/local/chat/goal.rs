@@ -429,6 +429,8 @@ mod tests {
 
     fn session(pursuit: Option<GoalState>) -> StoredChatSession {
         StoredChatSession {
+            profile_id: None,
+            native_fork_at: None,
             id: "chat".into(),
             project_id: "project".into(),
             harness: "claude-code".into(),
