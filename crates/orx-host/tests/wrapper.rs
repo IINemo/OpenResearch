@@ -20,6 +20,16 @@ fn serial() -> std::sync::MutexGuard<'static, ()> {
         .unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
+// Apple-signed shells hide their environment after reparenting; these fixtures need a visible run tag.
+const WAITING_DAEMON: &str = r#"python3 - <<'PYTHON' &
+import os, time
+with open('daemon.pid', 'w') as f: f.write(str(os.getpid()))
+open('ready', 'w').close()
+while not os.path.exists('release'): time.sleep(0.01)
+PYTHON
+while [ ! -f ready ]; do sleep 0.01; done
+"#;
+
 #[test]
 fn cancellation_before_started_never_spawns_the_payload() {
     let mut run = Run::new("touch should-not-run\n");
@@ -621,7 +631,7 @@ exit 23
 
 #[test]
 fn natural_daemon_exit_reaps_and_resolves_lingering_without_changing_the_result() {
-    let mut run = Run::new("bash -c 'echo $$ > daemon.pid; touch ready; while [ ! -f release ]; do sleep 0.05; done' &\nwhile [ ! -f ready ]; do sleep 0.01; done\nexit 0\n");
+    let mut run = Run::new(WAITING_DAEMON);
     run.spawn();
     until(Duration::from_secs(3), || {
         run.directory.0.join("exit.json").exists()
@@ -685,7 +695,7 @@ fn a_timed_out_hook_retries_before_the_receipt_then_recovers() {
 #[test]
 fn a_hook_prevents_lingering_from_upgrading_to_verified() {
     let _serial = serial();
-    let mut run = Run::new("bash -c 'touch ready; while [ ! -f release ]; do sleep .01; done' &\nwhile [ ! -f ready ]; do sleep .01; done\n");
+    let mut run = Run::new(WAITING_DAEMON);
     fs::write(run.directory.0.join("cancel.sh"), "true").unwrap();
     run.spawn();
     until(Duration::from_secs(3), || {
@@ -738,7 +748,7 @@ fn an_empty_unverifiable_receipt_does_not_skip_cleanup() {
 
 #[test]
 fn slurm_wrapper_releases_the_allocation_after_the_receipt() {
-    let mut run = Run::new("bash -c 'echo $$ > daemon.pid; touch ready; while [ ! -f release ]; do sleep .01; done' &\nwhile [ ! -f ready ]; do sleep .01; done\n");
+    let mut run = Run::new(WAITING_DAEMON);
     run.children.push(
         Command::new(env!("CARGO_BIN_EXE_orx-host"))
             .env("SLURM_JOB_ID", "123")
@@ -1260,7 +1270,15 @@ fn a_failure_before_the_payload_starts_ends_the_run_once_with_its_cause() {
 #[test]
 fn a_dead_wrapper_kills_term_resistant_processes_after_the_cancel_grace() {
     let _serial = serial();
-    let mut run = Run::new("trap '' TERM\ntouch ready\nwhile :; do sleep 0.05; done\n");
+    let mut run = Run::new(
+        r#"exec python3 - <<'PYTHON'
+import signal, time
+signal.signal(signal.SIGTERM, signal.SIG_IGN)
+open('ready', 'w').close()
+while True: time.sleep(1)
+PYTHON
+"#,
+    );
     run.spawn();
     run.ready();
     until(Duration::from_secs(3), || {
