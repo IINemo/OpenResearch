@@ -22,12 +22,17 @@ impl Api for ModalAccount {
         let mut spec: modal::ModalJobSpec =
             serde_json::from_value(intent.launch.options.clone()).map_err(api::rejected)?;
         spec.tags.insert("or_run".into(), intent.run.id.clone());
-        spec.env.extend(crate::config::launch_env(&intent.run.id));
+        spec.env.extend(crate::config::launch_env(&intent.run).map_err(api::rejected)?);
         modal::ensure_env().await.map_err(api::rejected)?;
         modal::run_job(&spec, Some(fence))
             .await
             .map(|sandbox| api::handle(intent, vec![sandbox]))
             .map_err(api::launch_error)
+    }
+    async fn quote(&self, _run: &WatchedRun, launch: &LaunchSpec) -> Result<Option<Quote>> {
+        let spec: modal::ModalJobSpec = serde_json::from_value(launch.options.clone())?;
+        modal::ensure_env().await?;
+        modal::hourly_price(&spec).await.map(Some)
     }
     async fn recover(&self, _intent: &RunIntent) -> Recovery {
         api::unknown(

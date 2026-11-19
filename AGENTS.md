@@ -20,12 +20,12 @@ OpenResearch turns the coding agents a researcher already has (Claude Code, Code
 - **The user's machine owns their research.** Code, experiments, runs, logs and chats never go to openresearch.sh unless the user publishes a project. Anything new that leaves the machine is a product decision: add it to the storage essay's list or don't ship it.
 - **Every shipped version stays out there.** Old apps stay open for days, a remote host runs a different `orx` than the laptop, and openresearch.sh serves every client in the wild. The store, settings, run descriptors and wire protocols only grow: add fields, never rename or repurpose one. Compatibility code is for shipped contracts; an unmerged change has no users.
 - **Loopback by default.** `orx up` binds 127.0.0.1 with no login, checks the Host of every request and the Origin of every request that changes state. Remote access goes over SSH; `orx up --host 0.0.0.0` is the user's explicit opt-in to a trusted private network.
-- **Agents are the user's own tools.** orx runs them in home directories it prepares, reusing the user's sign-in, and never edits their agent configuration beyond the one exception [agents](arc/agents.md#isolation) records.
+- **Agents are the user's own tools.** orx runs them in home directories it prepares, reusing the user's sign-in, and never edits their agent configuration beyond the exceptions [agents](arc/agents.md#isolation) records.
 - **Nothing is lost silently.** When orx cannot finish a turn, a queued message or a run, it records why and offers the way forward.
 
 ## Doing the task
 
-- **Do the whole task.** Finish what was asked on every surface it reaches: a new backend or agent gets the setup flow its siblings have, and a feature that works in one view works wherever that thing appears. An issue does not bound the scope, and each review finding is fixed or gets its own issue. If the work should split, propose the split and let the user choose.
+- **Do the whole task.** Finish what was asked on every surface it reaches: a new backend or agent gets the setup flow and the logo its siblings have, and a feature that works in one view works wherever that thing appears. An issue does not bound the scope, and each review finding is fixed or gets its own issue. If the work should split, propose the split and let the user choose.
 - **Fix the class, not the case.** When a bug is one instance of a pattern, fix it where every caller passes and check each site. A change that replaces a mechanism deletes the old one in the same change.
 - **Raise the expensive choice first.** Before building on a choice that is costly to undo (how two views share one piece of UI, the shape of a command agents call, a file format or a stored field), name it to the user and get a yes.
 - **Claim only what you saw.** Before saying something works, watch it work in the app or read it in the CI log, and say what you didn't check.

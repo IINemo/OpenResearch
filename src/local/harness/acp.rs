@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use agent_client_protocol::schema::v1::{
@@ -8,10 +8,13 @@ use agent_client_protocol::schema::v1::{
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
-use super::{Harness, HarnessInfo, ResumeAction, TurnFailure, TurnOutcome, TurnResult};
+use super::options::OptionChoice;
+use super::{
+    Harness, HarnessInfo, HarnessOptions, ResumeAction, TurnFailure, TurnOutcome, TurnResult,
+};
 use crate::error::{anyhow, Result};
 use crate::local::acp::{
-    host::{Client, Event},
+    host::{Client, Event, Stop},
     Definition,
 };
 use crate::local::chat::{
@@ -24,6 +27,21 @@ mod auth;
 pub(crate) const SESSION_SKILLS_DIR: &str = ".agents/skills";
 
 static DISCOVERY_SLOTS: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(2);
+
+pub fn approval_options() -> HarnessOptions {
+    HarnessOptions {
+        permission_modes: vec![
+            OptionChoice::described("ask", "Ask", "Ask before actions that need approval"),
+            OptionChoice::described(
+                "auto-approve",
+                "Full access",
+                "Approve each request without asking, except ones that can only be allowed permanently",
+            ),
+        ],
+        default_permission_mode: Some("ask"),
+        ..HarnessOptions::none()
+    }
+}
 
 pub struct Acp(pub Definition);
 
@@ -76,6 +94,10 @@ impl Harness for Acp {
     }
     fn supports_chat(&self) -> bool {
         true
+    }
+
+    fn options(&self) -> HarnessOptions {
+        approval_options()
     }
 
     fn session_skills_dir(&self) -> Option<&'static str> {
@@ -508,22 +530,20 @@ pub(crate) async fn prompt_session(ctx: &mut TurnCtx, session: &OpenSession) -> 
     );
     tokio::pin!(response);
     let mut tools = ToolUpdates::default();
+    let mut approved_permissions = HashSet::new();
     let mut watchdog = tokio::time::interval(std::time::Duration::from_secs(5));
     let mut deadline = tokio::time::Instant::now() + super::TURN_WATCHDOG;
     let result = loop {
         tokio::select! {
-            _ = ctx.flush_due() => { let _ = ctx.flush(); }
-            _ = watchdog.tick() => {
-                // A command the agent runs reports nothing until it exits, however long it takes.
-                if client.awaiting_permission() || tools.command_running() {
-                    deadline = tokio::time::Instant::now() + super::TURN_WATCHDOG;
-                } else if tokio::time::Instant::now() >= deadline {
-                    return Err(anyhow!("ACP turn exceeded the response timeout"));
-                }
-            }
+            // A completed turn cancels late permissions before any automatic decision.
+            biased;
             result = &mut response => {
                 let result = result?;
-                while let Ok(event) = events.try_recv() { apply_event(ctx, event, &mut tools)?; }
+                while let Ok(event) = events.try_recv() {
+                    if !matches!(&event, Event::Permission { id, .. } if approved_permissions.remove(id)) {
+                        apply_event(ctx, event, &mut tools)?;
+                    }
+                }
                 ctx.persist_delivery(DeliveryState::Accepted)?;
                 if let (Some(execution), Some(samples)) = (
                     ctx.usage_execution_id(),
@@ -535,19 +555,78 @@ pub(crate) async fn prompt_session(ctx: &mut TurnCtx, session: &OpenSession) -> 
                         eprintln!("orx up: could not persist ACP token usage: {error}");
                     }
                 }
+                if let (Some(execution), Some(cost)) = (ctx.usage_execution_id(), &tools.session_cost) {
+                    if let Err(error) = Store::open().and_then(|store| {
+                        store.record_acp_cost(execution, &ctx.harness, &session.native_id, cost, session.restored)
+                    }) {
+                        eprintln!("orx up: could not persist ACP cost: {error}");
+                    }
+                }
                 if result["stopReason"] == "cancelled" { return Err(anyhow!("Agent turn was cancelled")); }
                 break result;
             }
+            _ = ctx.flush_due() => { let _ = ctx.flush(); }
+            _ = watchdog.tick() => {
+                approved_permissions.extend(approve_permissions(ctx, client)?);
+                // A command the agent runs reports nothing until it exits, however long it takes.
+                if client.awaiting_permission() || tools.command_running() {
+                    deadline = tokio::time::Instant::now() + super::TURN_WATCHDOG;
+                } else if tokio::time::Instant::now() >= deadline {
+                    let silence = format!(
+                        "stopped responding for {} minutes",
+                        super::TURN_WATCHDOG.as_secs() / 60
+                    );
+                    return Err(anyhow!(client.end(Stop::Failure(silence)).await));
+                }
+            }
             event = events.recv() => {
-                let event = event.ok_or_else(|| anyhow!("ACP process exited during the turn; the prompt was not replayed"))?;
+                let Some(event) = event else {
+                    return Err(client.connection_error().await);
+                };
                 deadline = tokio::time::Instant::now() + super::TURN_WATCHDOG;
                 ctx.mark_delivery(DeliveryState::Accepted);
+                approved_permissions.extend(approve_permissions(ctx, client)?);
+                if matches!(&event, Event::Permission { id, .. } if approved_permissions.remove(id)) {
+                    continue;
+                }
                 apply_event(ctx, event, &mut tools)?;
             }
         }
     };
     ctx.flush()?;
     Ok(result)
+}
+
+fn approve_permissions(ctx: &mut TurnCtx, client: &Client) -> Result<Vec<String>> {
+    if !ctx.harness.starts_with("acp:") || !client.awaiting_permission() {
+        return Ok(Vec::new());
+    }
+    let session = Store::open()?
+        .get_chat_session(&ctx.session_id)?
+        .ok_or_else(|| anyhow!("chat session not found"))?;
+    if session.harness != ctx.harness || session.permission_mode.as_deref() != Some("auto-approve")
+    {
+        return Ok(Vec::new());
+    }
+    let approved = client.approve_pending()?;
+    let mut changed = false;
+    for part in &mut ctx.assistant.parts {
+        if let Some(prompt) = part.prompt.as_mut() {
+            if let Some((_, choice)) = approved
+                .iter()
+                .find(|(id, _)| prompt.native_id.as_ref() == Some(id))
+            {
+                prompt.resolved = true;
+                prompt.approved = Some(true);
+                prompt.answers = vec![choice.clone()];
+                changed = true;
+            }
+        }
+    }
+    if changed {
+        ctx.flush()?;
+    }
+    Ok(approved.into_iter().map(|(id, _)| id).collect())
 }
 
 /// Native counters with input made inclusive of cache; `None` unless they add up to `totalTokens`.
@@ -629,6 +708,8 @@ struct ToolUpdates {
     terminals: HashMap<String, String>,
     /// Tool activity since the last text, which the next text follows as a new part.
     text_break: bool,
+    /// The session's running cost from the agent's latest `usage_update`.
+    session_cost: Option<crate::store::Cost>,
 }
 
 impl ToolUpdates {
@@ -746,10 +827,14 @@ fn apply_event(ctx: &mut TurnCtx, event: Event, tools: &mut ToolUpdates) -> Resu
                 }
             }
             Some("usage_update") => {
+                if let Some(cost) = usage_cost(&update["cost"]) {
+                    tools.session_cost = Some(cost);
+                }
                 if let Some(used_tokens) = update["used"].as_u64() {
                     ctx.report_usage(crate::local::chat::ContextUsage {
                         used_tokens,
                         context_window: update["size"].as_u64(),
+                        ..Default::default()
                     });
                 }
             }
@@ -758,6 +843,11 @@ fn apply_event(ctx: &mut TurnCtx, event: Event, tools: &mut ToolUpdates) -> Resu
     }
     ctx.maybe_flush();
     Ok(())
+}
+
+/// ACP's `{amount, currency}`, the session's cumulative cost.
+fn usage_cost(cost: &Value) -> Option<crate::store::Cost> {
+    crate::store::Cost::of(cost["amount"].as_f64()?, cost["currency"].as_str()?)
 }
 
 fn permission_input(tool: &Value) -> Option<Value> {
@@ -779,27 +869,35 @@ fn render_tool(ctx: &mut TurnCtx, id: &str, tool: &Value, terminals: &HashMap<St
         _ => "running",
     };
     let raw_input = tool.get("rawInput");
-    let (name, input) = match (tool["title"].as_str(), tool["name"].as_str()) {
-        (Some("subagent" | "task" | "Agent" | "Task"), _) => ("task", raw_input.cloned()),
-        (Some("SubagentHandback"), _) => ("SubagentHandback", raw_input.cloned()),
+    let antigravity = ctx.harness == "antigravity";
+    let native = tool["name"].as_str().filter(|_| antigravity);
+    let (name, input) = match (tool["title"].as_str(), native) {
+        (Some("subagent" | "task" | "Agent" | "Task"), _) => ("task".into(), raw_input.cloned()),
+        (Some("SubagentHandback"), _) => ("SubagentHandback".into(), raw_input.cloned()),
         // agy sends its own tool name and argument names, as in its transcripts.
-        (_, Some(native)) if ctx.harness == "antigravity" => {
-            super::antigravity::normalize_tool(native, raw_input)
-        }
+        (_, Some(native)) => super::antigravity::normalize_tool(native, raw_input),
         _ => (
             match tool["kind"].as_str() {
                 Some("execute") => "bash",
                 Some(kind) => kind,
                 None => "tool",
-            },
+            }
+            .into(),
             raw_input.cloned(),
         ),
     };
     let mut part = WirePart::tool(format!("acp-tool-{id}"), name, status, None);
     if let Some(state) = part.state.as_mut() {
-        state.title = tool["title"].as_str().map(str::to_owned);
+        // agy titles an MCP call with no more than its tool's name.
+        state.title = tool["title"]
+            .as_str()
+            .filter(|title| native.is_none_or(|native| !title.contains(native)))
+            .map(str::to_owned);
         state.input = input;
-        state.output = tool_output(tool, terminals);
+        state.output = match tool_output(tool, terminals) {
+            Some(output) if antigravity => Some(super::antigravity::without_hook_notice(&output)),
+            output => output,
+        };
     }
     ctx.upsert_part(part);
 }
@@ -942,6 +1040,33 @@ mod tests {
             &json!({"configOptions":[], "models":{"availableModels":[{"modelId":"legacy"}]}})
         )
         .is_empty());
+    }
+
+    #[test]
+    fn usage_updates_keep_the_sessions_latest_cost() {
+        let mut ctx = TurnCtx::test_stub();
+        let mut tools = ToolUpdates::default();
+        for update in [
+            json!({"sessionUpdate": "usage_update", "used": 900, "size": 200000,
+                   "cost": {"amount": 0.42, "currency": "usd"}}),
+            json!({"sessionUpdate": "usage_update", "used": 1200, "size": 200000}),
+            json!({"sessionUpdate": "usage_update", "used": 1300,
+                   "cost": {"amount": "lots", "currency": "USD"}}),
+        ] {
+            apply_event(&mut ctx, Event::Update(update), &mut tools).unwrap();
+        }
+        let cost = tools.session_cost.unwrap();
+        assert_eq!((cost.micros, cost.currency.as_str()), (420_000, "USD"));
+        assert_eq!(ctx.context_usage.unwrap().used_tokens, 1300);
+        assert!(usage_cost(&json!({"amount": 1, "currency": ""})).is_none());
+        assert!(usage_cost(&json!({"amount": -1, "currency": "EUR"})).is_none());
+        assert_eq!(
+            usage_cost(&json!({"amount": 2.5, "currency": "EUR"})).unwrap(),
+            crate::store::Cost {
+                micros: 2_500_000,
+                currency: "EUR".into()
+            }
+        );
     }
 
     #[test]

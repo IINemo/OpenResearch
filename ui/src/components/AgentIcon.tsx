@@ -3,12 +3,13 @@ import { Popover } from "@base-ui/react/popover";
 import type { Gemoji } from "gemoji";
 import {
   Apple, Bot, BoxIcon, Brain, BriefcaseBusiness, Building2, Check, CodeXml, Flag, Flame, FlaskConical, Ghost,
-  GraduationCap, Heart, House, Leaf, Lightbulb, Moon, Pencil, Plane, Plus, Rocket, Search, Smile, Sparkles,
+  GraduationCap, Heart, House, Leaf, Lightbulb, Moon, Pencil, Plane, Plus, Rocket, RotateCcw, Search, Smile, Sparkles,
   SquareTerminal, Star, Trophy, User, Zap, type LucideIcon,
 } from "lucide-react";
-import type { AgentIcon, AgentIconColor } from "../api";
+import type { AgentIcon, AgentIconColor, ProjectIcon } from "../api";
 import { m } from "../paraglide/messages.js";
 import { WorkspaceDomContext } from "../WorkspaceDom";
+import { LOGOS, logoMark } from "./HarnessLogo";
 import { Button, Input, SEGMENTED_CLASS_NAME } from "./ui";
 import { cn } from "./ui/cn";
 
@@ -18,18 +19,18 @@ const PLAIN = { tile: "border-border text-text", cell: "aria-checked:border-bord
 /** A provider's own logo in the plain outline: every agent's mark until the user picks another. */
 export const BRAND_ICON: AgentIcon = { brand: true };
 
-/** Whole class strings so Tailwind sees them: `tile` tints a glyph or emoji, `solid` fills behind an image, `cell` marks the picked cell. */
-const COLORS: Record<AgentIconColor, { label: () => string; tile: string; solid: string; cell: string }> = {
-  gray: { label: m.icon_color_gray, tile: "border-muted/30 bg-muted/12 text-subtext", solid: "bg-muted", cell: "aria-checked:border-muted/40 aria-checked:bg-muted/14 aria-checked:text-text" },
-  red: { label: m.icon_color_red, tile: "border-accent-red/25 bg-accent-red/12 text-accent-red", solid: "bg-accent-red", cell: "aria-checked:border-accent-red/40 aria-checked:bg-accent-red/14 aria-checked:text-accent-red" },
-  orange: { label: m.icon_color_orange, tile: "border-accent-orange/25 bg-accent-orange/12 text-accent-orange", solid: "bg-accent-orange", cell: "aria-checked:border-accent-orange/40 aria-checked:bg-accent-orange/14 aria-checked:text-accent-orange" },
-  amber: { label: m.icon_color_amber, tile: "border-accent-amber/25 bg-accent-amber/12 text-accent-amber", solid: "bg-accent-amber", cell: "aria-checked:border-accent-amber/40 aria-checked:bg-accent-amber/14 aria-checked:text-accent-amber" },
-  green: { label: m.icon_color_green, tile: "border-accent-green/25 bg-accent-green/12 text-accent-green", solid: "bg-accent-green", cell: "aria-checked:border-accent-green/40 aria-checked:bg-accent-green/14 aria-checked:text-accent-green" },
-  teal: { label: m.icon_color_teal, tile: "border-accent-teal/25 bg-accent-teal/12 text-accent-teal", solid: "bg-accent-teal", cell: "aria-checked:border-accent-teal/40 aria-checked:bg-accent-teal/14 aria-checked:text-accent-teal" },
-  blue: { label: m.icon_color_blue, tile: "border-accent-blue/25 bg-accent-blue/12 text-accent-blue", solid: "bg-accent-blue", cell: "aria-checked:border-accent-blue/40 aria-checked:bg-accent-blue/14 aria-checked:text-accent-blue" },
-  indigo: { label: m.icon_color_indigo, tile: "border-accent-indigo/25 bg-accent-indigo/12 text-accent-indigo", solid: "bg-accent-indigo", cell: "aria-checked:border-accent-indigo/40 aria-checked:bg-accent-indigo/14 aria-checked:text-accent-indigo" },
-  purple: { label: m.icon_color_purple, tile: "border-accent-purple/25 bg-accent-purple/12 text-accent-purple", solid: "bg-accent-purple", cell: "aria-checked:border-accent-purple/40 aria-checked:bg-accent-purple/14 aria-checked:text-accent-purple" },
-  pink: { label: m.icon_color_pink, tile: "border-accent-pink/25 bg-accent-pink/12 text-accent-pink", solid: "bg-accent-pink", cell: "aria-checked:border-accent-pink/40 aria-checked:bg-accent-pink/14 aria-checked:text-accent-pink" },
+/** Whole class strings so Tailwind sees them: `tile` tints a glyph or emoji, `fill` is the borderless tint, `solid` fills behind an image, `cell` marks the picked cell. */
+const COLORS: Record<AgentIconColor, { label: () => string; tile: string; fill: string; solid: string; cell: string }> = {
+  gray: { label: m.icon_color_gray, tile: "border-muted/30 bg-muted/12 text-subtext", solid: "bg-muted", fill: "bg-muted/20 text-subtext", cell: "aria-checked:border-muted/40 aria-checked:bg-muted/14 aria-checked:text-text" },
+  red: { label: m.icon_color_red, tile: "border-accent-red/25 bg-accent-red/12 text-accent-red", solid: "bg-accent-red", fill: "bg-accent-red/20 text-accent-red", cell: "aria-checked:border-accent-red/40 aria-checked:bg-accent-red/14 aria-checked:text-accent-red" },
+  orange: { label: m.icon_color_orange, tile: "border-accent-orange/25 bg-accent-orange/12 text-accent-orange", solid: "bg-accent-orange", fill: "bg-accent-orange/20 text-accent-orange", cell: "aria-checked:border-accent-orange/40 aria-checked:bg-accent-orange/14 aria-checked:text-accent-orange" },
+  amber: { label: m.icon_color_amber, tile: "border-accent-amber/25 bg-accent-amber/12 text-accent-amber", solid: "bg-accent-amber", fill: "bg-accent-amber/20 text-accent-amber", cell: "aria-checked:border-accent-amber/40 aria-checked:bg-accent-amber/14 aria-checked:text-accent-amber" },
+  green: { label: m.icon_color_green, tile: "border-accent-green/25 bg-accent-green/12 text-accent-green", solid: "bg-accent-green", fill: "bg-accent-green/20 text-accent-green", cell: "aria-checked:border-accent-green/40 aria-checked:bg-accent-green/14 aria-checked:text-accent-green" },
+  teal: { label: m.icon_color_teal, tile: "border-accent-teal/25 bg-accent-teal/12 text-accent-teal", solid: "bg-accent-teal", fill: "bg-accent-teal/20 text-accent-teal", cell: "aria-checked:border-accent-teal/40 aria-checked:bg-accent-teal/14 aria-checked:text-accent-teal" },
+  blue: { label: m.icon_color_blue, tile: "border-accent-blue/25 bg-accent-blue/12 text-accent-blue", solid: "bg-accent-blue", fill: "bg-accent-blue/20 text-accent-blue", cell: "aria-checked:border-accent-blue/40 aria-checked:bg-accent-blue/14 aria-checked:text-accent-blue" },
+  indigo: { label: m.icon_color_indigo, tile: "border-accent-indigo/25 bg-accent-indigo/12 text-accent-indigo", solid: "bg-accent-indigo", fill: "bg-accent-indigo/20 text-accent-indigo", cell: "aria-checked:border-accent-indigo/40 aria-checked:bg-accent-indigo/14 aria-checked:text-accent-indigo" },
+  purple: { label: m.icon_color_purple, tile: "border-accent-purple/25 bg-accent-purple/12 text-accent-purple", solid: "bg-accent-purple", fill: "bg-accent-purple/20 text-accent-purple", cell: "aria-checked:border-accent-purple/40 aria-checked:bg-accent-purple/14 aria-checked:text-accent-purple" },
+  pink: { label: m.icon_color_pink, tile: "border-accent-pink/25 bg-accent-pink/12 text-accent-pink", solid: "bg-accent-pink", fill: "bg-accent-pink/20 text-accent-pink", cell: "aria-checked:border-accent-pink/40 aria-checked:bg-accent-pink/14 aria-checked:text-accent-pink" },
 };
 
 /** Stored by id, so an id once offered keeps its glyph. */
@@ -55,8 +56,10 @@ const GLYPHS: [id: string, label: () => string, Icon: LucideIcon][] = [
   ["ghost", m.icon_glyph_ghost, Ghost],
 ];
 
-const TILE_SIZES = {
+export const TILE_SIZES = {
+  sm: { box: "size-4 rounded-[5px] text-2xs", mark: 11 },
   xs: { box: "size-5 rounded-md text-xs", mark: 13 },
+  ring: { box: "size-[15px] rounded-full border-0 text-2xs", mark: 10 },
   md: { box: "size-8 rounded-lg text-lg", mark: 18 },
   lg: { box: "size-11 rounded-xl text-2xl", mark: 24 },
 } as const;
@@ -64,8 +67,12 @@ const TILE_SIZES = {
 /** A mark the picker offers first: the provider's own logo, drawn at the size asked. */
 export type Logo = (size: number) => ReactNode;
 
-function IconMark({ icon, brand, size }: { icon: AgentIcon; brand: Logo; size: number }) {
+/** Resolves a project icon's repository image to a URL; agents have none. */
+export type FileUrl = (path: string) => string;
+
+function IconMark({ icon, brand, size, fileUrl }: { icon: ProjectIcon; brand: Logo; size: number; fileUrl?: FileUrl }) {
   if ("emoji" in icon) return <span className="leading-none">{icon.emoji}</span>;
+  if ("file" in icon) return <img alt="" draggable={false} className="size-full object-cover" src={fileUrl?.(icon.file)} />;
   if ("image" in icon) return <img alt="" draggable={false} className="size-full object-cover" src={`data:${icon.image.type};base64,${icon.image.data}`} />;
   if ("brand" in icon) return brand(size);
   // A glyph another version stored and this one doesn't draw is a box.
@@ -74,9 +81,12 @@ function IconMark({ icon, brand, size }: { icon: AgentIcon; brand: Logo; size: n
 }
 
 /** An agent's mark in its tile: on its colour, or in a plain outline. */
-export function AgentIconTile({ icon, brand, size = "md", outline = true }: {
-  icon: AgentIcon;
+export function AgentIconTile({ icon, brand, size = "md", outline = true, fill = false, fileUrl }: {
+  icon: ProjectIcon;
+  /** Tint a coloured glyph, emoji or brand on a stronger fill with no border. */
+  fill?: boolean;
   brand: Logo;
+  fileUrl?: FileUrl;
   size?: keyof typeof TILE_SIZES;
   /** Whether an uncoloured icon draws its tile's border; without it, its mark grows into the space the border framed. */
   outline?: boolean;
@@ -84,9 +94,10 @@ export function AgentIconTile({ icon, brand, size = "md", outline = true }: {
   const color = icon.color && COLORS[icon.color];
   const bare = !color && !outline;
   const plain = bare ? cn(PLAIN.tile, "border-transparent") : PLAIN.tile;
+  const picture = "image" in icon || "file" in icon;
   return (
-    <span aria-hidden="true" className={cn("grid shrink-0 place-items-center overflow-hidden border", TILE_SIZES[size].box, !color ? plain : "image" in icon ? cn("border-transparent", color.solid) : color.tile)}>
-      <IconMark icon={icon} brand={brand} size={TILE_SIZES[size].mark + (bare ? 4 : 0)} />
+    <span aria-hidden="true" className={cn("grid shrink-0 place-items-center overflow-hidden border", TILE_SIZES[size].box, !color ? (fill && picture ? "border-transparent" : plain) : picture ? cn("border-transparent", color.solid) : fill ? cn("border-transparent", color.fill) : color.tile)}>
+      <IconMark icon={icon} brand={brand} size={TILE_SIZES[size].mark + (bare ? 4 : 0)} fileUrl={fileUrl} />
     </span>
   );
 }
@@ -94,9 +105,27 @@ export function AgentIconTile({ icon, brand, size = "md", outline = true }: {
 const GRID = "grid grid-cols-[repeat(auto-fill,minmax(2rem,1fr))] gap-1";
 const CELL = "grid h-8.5 place-items-center rounded-lg border border-transparent text-subtext outline-none hover:bg-hover-muted hover:text-text focus-visible:outline-2 focus-visible:outline-focus";
 
-/** Icons with the provider's logo first, Emoji and Image tabs, over a colour row. */
-function AgentIconPicker({ value, brand, onChange }: { value: AgentIcon; brand: Logo; onChange: (icon: AgentIcon) => void }) {
-  const [tab, setTab] = useState<"icons" | "emoji" | "image">(() => "emoji" in value ? "emoji" : "image" in value ? "image" : "icons");
+/** A pick from the icon picker; `logo` is set when it pins a logo, and `null` when it goes back to the row's own. */
+export type IconPick = (icon: AgentIcon, logo?: string | null) => void;
+
+type PickerTab = "icons" | "logos" | "emoji" | "image" | "repo";
+const AGENT_TABS: readonly PickerTab[] = ["icons", "logos", "emoji", "image"];
+const TAB_LABELS: Record<PickerTab, () => string> = {
+  icons: m.icon_tab_icons, logos: m.icon_tab_logos, emoji: m.icon_tab_emoji, image: m.icon_tab_image, repo: m.icon_tab_repo,
+};
+
+/** Icons with the `brand` mark first, then the other `tabs`, over a colour row; `repo` draws the Repo tab. */
+export function IconPicker({ value, brand, brandLabel, logo, tabs, repo, fileUrl, onChange }: {
+  value: ProjectIcon;
+  brand: Logo;
+  brandLabel: string;
+  logo?: string;
+  tabs: readonly PickerTab[];
+  repo?: (pick: (file: string) => void) => ReactNode;
+  fileUrl?: FileUrl;
+  onChange: (icon: ProjectIcon, logo?: string | null) => void;
+}) {
+  const [tab, setTab] = useState<PickerTab>(() => "emoji" in value ? "emoji" : "image" in value ? "image" : "file" in value ? "repo" : logo ? "logos" : "icons");
   const [imageError, setImageError] = useState(false);
   const fileInput = useRef<HTMLInputElement>(null);
   const color = value.color;
@@ -109,9 +138,9 @@ function AgentIconPicker({ value, brand, onChange }: { value: AgentIcon; brand: 
   return (
     <div className="grid gap-3">
       <div className={cn(SEGMENTED_CLASS_NAME, "flex w-full")} role="group" aria-label={m.icon_kind()}>
-        {(["icons", "emoji", "image"] as const).map((id) => (
+        {tabs.map((id) => (
           <button key={id} type="button" aria-pressed={tab === id} className={cn("flex-1 justify-center", tab === id && "active")} onClick={() => setTab(id)}>
-            {id === "icons" ? m.icon_tab_icons() : id === "emoji" ? m.icon_tab_emoji() : m.icon_tab_image()}
+            {TAB_LABELS[id]()}
           </button>
         ))}
       </div>
@@ -142,7 +171,7 @@ function AgentIconPicker({ value, brand, onChange }: { value: AgentIcon; brand: 
       </div>
       {tab === "icons" ? (
         <div role="radiogroup" aria-label={m.icon_tab_icons()} className={GRID}>
-          <button type="button" role="radio" aria-checked={"brand" in value} aria-label={m.icon_provider_logo()} className={cell} onClick={() => onChange({ brand: true, color })}>
+          <button type="button" role="radio" aria-checked={"brand" in value} aria-label={brandLabel} className={cell} onClick={() => onChange({ brand: true, color })}>
             {brand(18)}
           </button>
           {GLYPHS.map(([id, label, Glyph]) => (
@@ -151,12 +180,16 @@ function AgentIconPicker({ value, brand, onChange }: { value: AgentIcon; brand: 
             </button>
           ))}
         </div>
+      ) : tab === "logos" ? (
+        <LogoPicker pinned={"brand" in value ? logo : undefined} cell={cell} onPick={(slug) => onChange({ brand: true, color }, slug)} />
       ) : tab === "emoji" ? (
         <EmojiPicker value={"emoji" in value ? value.emoji : null} cell={cell} onPick={(emoji) => onChange({ emoji, color })} />
+      ) : tab === "repo" ? (
+        repo?.((file) => onChange({ file }))
       ) : (
         <div className="flex items-center gap-3.5">
           {"image" in value ? (
-            <AgentIconTile icon={value} brand={brand} size="lg" />
+            <AgentIconTile icon={value} brand={brand} size="lg" fileUrl={fileUrl} />
           ) : (
             <span aria-hidden="true" className="grid size-11 place-items-center rounded-xl border border-dashed border-border text-muted"><Plus size={20} /></span>
           )}
@@ -181,6 +214,40 @@ function AgentIconPicker({ value, brand, onChange }: { value: AgentIcon; brand: 
           />
         </div>
       )}
+    </div>
+  );
+}
+
+/** Every logo a row can wear, searchable by name; the first cell unpins, going back to the logo the row finds for itself. */
+function LogoPicker({ pinned, cell, onPick }: { pinned: string | undefined; cell: string; onPick: (slug: string | null) => void }) {
+  const [query, setQuery] = useState("");
+  const search = query.trim().toLowerCase();
+  const shown = LOGOS.filter((logo) => !search || logo.name.toLowerCase().includes(search) || logo.slug.includes(search));
+  return (
+    <div className="grid gap-2">
+      <label className="relative block">
+        <span className="sr-only">{m.icon_logo_search()}</span>
+        <Search size={14} className="pointer-events-none absolute start-2.5 top-1/2 -translate-y-1/2 text-muted" aria-hidden="true" />
+        <Input type="search" autoComplete="off" spellCheck={false} placeholder={m.icon_logo_search()} value={query} onChange={(event) => setQuery(event.target.value)} className="ps-8 [&::-webkit-search-cancel-button]:hidden" />
+      </label>
+      <div className="h-48 overflow-y-auto pe-1">
+        <div role="radiogroup" aria-label={m.icon_tab_logos()} className={GRID}>
+          {!search && (
+            <button type="button" role="radio" aria-checked={!pinned} aria-label={m.icon_logo_detected()} title={m.icon_logo_detected()} className={cell} onClick={() => onPick(null)}>
+              <RotateCcw size={18} aria-hidden="true" />
+            </button>
+          )}
+          {shown.map((logo) => {
+            const mark = logoMark(logo.slug)!;
+            return (
+              <button key={logo.slug} type="button" role="radio" aria-checked={logo.slug === pinned} aria-label={logo.name} title={logo.name} className={cell} onClick={() => onPick(logo.slug)}>
+                {mark(18)}
+              </button>
+            );
+          })}
+        </div>
+        {shown.length === 0 && <p role="status" className="m-0 py-8 text-center text-sm text-subtext">{m.icon_logo_none({ query: query.trim() })}</p>}
+      </div>
     </div>
   );
 }
@@ -258,8 +325,24 @@ function EmojiPicker({ value, cell, onPick }: { value: string | null; cell: stri
   );
 }
 
-/** The tile with a pencil badge, opening the picker; each pick reaches `onChange` at once. */
-export function AgentIconButton({ value, brand, onChange, disabled }: { value: AgentIcon; brand: Logo; onChange: (icon: AgentIcon) => void; disabled?: boolean }) {
+/** The tile with a pencil badge, opening the picker; each pick reaches `onChange` at once. `logo` is the one pinned. */
+export function AgentIconButton({ value, brand, logo, onChange, disabled }: { value: AgentIcon; brand: Logo; logo?: string; onChange: IconPick; disabled?: boolean }) {
+  return (
+    <IconPickerButton tile={<AgentIconTile icon={value} brand={brand} size="lg" />} disabled={disabled}>
+      <IconPicker
+        value={value}
+        brand={brand}
+        brandLabel={m.icon_provider_logo()}
+        logo={logo}
+        tabs={AGENT_TABS}
+        onChange={(icon, pinned) => { if (!("file" in icon)) onChange(icon, pinned); }}
+      />
+    </IconPickerButton>
+  );
+}
+
+/** A large icon tile with a pencil badge that opens `children`, the picker, in a popover. */
+export function IconPickerButton({ tile, disabled, children }: { tile: ReactNode; disabled?: boolean; children: ReactNode }) {
   const { portalContainer } = useContext(WorkspaceDomContext);
   return (
     <Popover.Root>
@@ -269,7 +352,7 @@ export function AgentIconButton({ value, brand, onChange, disabled }: { value: A
         aria-label={m.icon_change()}
         className="group relative inline-grid shrink-0 rounded-xl outline-none focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-focus disabled:cursor-default"
       >
-        <AgentIconTile icon={value} brand={brand} size="lg" />
+        {tile}
         {!disabled && (
           <span className="absolute -end-1 -bottom-1 grid size-4.5 place-items-center rounded-full border border-border bg-background text-subtext shadow-control-subtle group-hover:text-text">
             <Pencil size={10} aria-hidden="true" />
@@ -280,7 +363,7 @@ export function AgentIconButton({ value, brand, onChange, disabled }: { value: A
         {/* Above the z-200 dialogs, since the wizard opens it too. */}
         <Popover.Positioner className="z-210" side="bottom" align="start" sideOffset={6} collisionPadding={8}>
           <Popover.Popup aria-label={m.icon_change()} className="w-76 max-w-[calc(100vw_-_16px)] rounded-lg border border-border bg-background p-3 shadow-dropdown outline-none">
-            <AgentIconPicker value={value} brand={brand} onChange={onChange} />
+            {children}
           </Popover.Popup>
         </Popover.Positioner>
       </Popover.Portal>

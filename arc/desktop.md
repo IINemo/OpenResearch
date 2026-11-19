@@ -16,7 +16,7 @@ Each platform's package wraps one `orx` binary that is the CLI an agent shells o
 Anything but `app`, `app <openresearch: link>` or `app <file.orx>` is a CLI invocation. A file becomes a `file:` link, so both travel one path, including to a running app.
 
 - **Windows** would flash a window for every console program a GUI process starts, so `windows/launcher/` starts `orx.exe app` in a hidden console shared by orx and everything it runs. **The launcher changes only with a new installer**, so `orx app [link]` is a contract with every installed launcher. `windows/OpenResearch.iss` installs per user, so `orx.exe` can replace itself without elevation.
-- **Linux** bundles WebKitGTK in the AppImage, so its library floor is glibc's, set for every user by the Ubuntu runners that build it. AppRun records the session's values before running the GTK hooks once, points GTK at the bundle and starts orx inside the read-only mount; orx restores those values for the host programs it opens (`src/local/shell_env.rs`, in step with AppRun's list). The session chooses Wayland or X11 unless the user sets `GDK_BACKEND`; the bundling plugin's X11 default must not override that choice. Each start points a desktop entry at the AppImage's current path, which also claims `openresearch:` links and `.orx` files.
+- **Linux** keeps a bundled WebKitGTK fallback at the Ubuntu builder's glibc floor. AppRun finds the system WebKitGTK 4.1 directory through `ldconfig` and verifies that it can load the desktop binary; otherwise it applies the bundled GTK hooks. Before loading a page, the app checks media elements in an isolated Rust child. Missing or incompatible plugins disable media, Web Audio and MediaSource in the webview while leaving the dashboard and HTML usable. Previews give installation instructions; [Linux runtime dependencies](../linux/README.md) lists the packages. GStreamer plugins and codecs stay on the host. Package tests open the media fixture in the app's own HTML preview and cover both runtimes and missing plugins. Stable rebuilds take packaging tools from the workflow revision and the desktop binary from the release revision. AppRun records the session's values before changing library or GTK paths; orx restores those values for host programs (`src/local/shell_env.rs`, in step with AppRun's list). The session chooses Wayland or X11 unless the user sets `GDK_BACKEND`. Each start points a desktop entry at the AppImage's current path, which also claims `openresearch:` links and `.orx` files.
 
 ## App mode
 
@@ -32,8 +32,8 @@ The main thread owns the window's run loop, as every desktop toolkit requires, w
 
 **Work never stops without the user choosing it.** When the app runs its own server, a close and a quit take the same path:
 
-- **Nothing pending:** the app quits. Pending work is a running chat turn, an unfinished run, or a run whose result no chat has received.
-- **Work pending:** the page lists each running chat and pending run under what quitting does to it, following them as they finish and dropping the close once none is left, and opening one cancels the close and shows it. The user chooses between quitting, keeping the work running and going back. Only the page is themed and translated and can open what it lists, so a windowless close brings the window back to ask there; when the page cannot ask, or does not load or show the dialog in time, a native alert names the same work. Work that could not be counted is asked about as if agents were running.
+- **Nothing pending:** the app quits. Pending work is a chat the sidebar shows working, read from the turns the server holds in memory, an unfinished run, or a run whose result no chat has received. A store that cannot be read is a bug to log, not a question for the user, so the app quits.
+- **Work pending:** the page lists each running chat and pending run under what quitting does to it, following them as they finish and dropping the close once none is left, and opening one cancels the close and shows it. The user chooses between quitting, keeping the work running and going back. Only the page is themed and translated and can open what it lists, so a windowless close brings the window back to ask there; when the page cannot ask, or does not load or show the dialog in time, a native alert names the same work.
 - **Some runs keep the app from quitting.** Most backends finish a run and keep its outcome without the app, and a run under a 0.2.x supervisor is finished by it. A run on this machine, Tinker included, would outlive the app on a machine the user believes is free to shut down; a Vercel sandbox bills until its session ends and loses its log unless the engine stops it; an OpenResearch box releases itself, with any uncollected outcome, a bounded grace after the run ([experiments](experiments.md)). While one of these is pending, Quit becomes Force Quit: the window goes, each such run is asked to stop, and the app quits once all have answered or ten seconds have passed, asking any launched meanwhile to stop as well.
 - **Keeping it running:** on macOS the window hides, the page unloads and the engine runs windowless, with the Dock icon to bring it back; a fullscreen window leaves fullscreen first, because hiding it in place strands its Space. Windows and Linux have nothing that shows a hidden app, so the window minimizes instead.
 - **Quit:** agents stop.
@@ -60,7 +60,8 @@ How an update applies depends on the install (`src/updates.rs`, `src/updates/`, 
 
 | Installed by | Applies its own updates by |
 | --- | --- |
-| the shell or PowerShell installer | running the installer again; a receipt proves the binary is the installer's |
+| the shell installer | running the installer again; a receipt proves the binary is the installer's |
+| the PowerShell installer | unpacking the release's checksummed `.zip`, then the Windows renames; a receipt proves the binary is the installer's |
 | the macOS app | checking the DMG's hash, pinned signature and notarization, renaming the bundle into place |
 | the AppImage | checking the new file's hash, renaming it over the old one |
 | the Windows app or a zip's `orx.exe` | staging the new `orx.exe`, then two renames |
@@ -92,9 +93,9 @@ Every push to main also runs `release-canary.yml`: desktop builds beside `releas
 
 ## The gate on main
 
-Main requires `fmt, clippy, test` and `version sanity`, administrators included. Branch protection matches those job names in `.github/workflows/ci.yml`, so renaming either blocks every merge. There is no merge queue and no requirement to be up to date with main.
+Main requires `CI passed` and `version sanity`, administrators included. Branch protection matches those job names in `.github/workflows/ci.yml`, so renaming either blocks every merge. There is no merge queue and no requirement to be up to date with main.
 
-- Pull request CI tests GitHub's simulated merge. `scripts/ci-changes.mjs` selects jobs by changed files, and `fmt, clippy, test` fails on any failed job and on any job skipped that those files should have run.
+- Pull request CI tests GitHub's simulated merge. `scripts/ci-changes.mjs` selects jobs by changed files, and `CI passed` fails on any failed job and on any job skipped that those files should have run.
 
 ## Scripts and workflows
 

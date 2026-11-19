@@ -11,8 +11,8 @@ use serde_json::{json, Value};
 use super::{harnesses_payload, reject_if_moving, ApiError, ApiResult, AppState, HarnessQuery};
 use crate::error::{anyhow, bail, Result};
 use crate::local::chat::{
-    delegation, goal, news, OrxDisplay, OrxKind, OrxSource, PromptAnswer, TurnOverrides,
-    ORX_MESSAGE_PREFIX,
+    delegation, env_request, goal, news, OrxDisplay, OrxKind, OrxSource, PromptAnswer,
+    TurnOverrides, ORX_MESSAGE_PREFIX,
 };
 use crate::local::model_routes;
 use crate::store::{GoalState, Store, StoredChatSession};
@@ -96,8 +96,8 @@ fn tools(harness: &str) -> Value {
                     "route": { "type": "string", "description": "Optional route from `models`, such as `openrouter`. Omit to use orx's order." },
                     "effort": { "type": "string", "description": "Optional effort level from `models`. Omit for the route's default." },
                     "title": { "type": "string", "description": "Optional short name for the delegate's chat." },
-                    "worktree": { "type": "string", "enum": ["shared", "own"], "description": "`shared` (the default) works in this chat's worktree. `own` gets a fresh worktree from the project's baseline and appears in the sidebar; commit first and name the commit in `task` if it should start from your work." },
-                    "notify": { "type": "boolean", "description": "Default true. False starts a chat that is not your delegate: a side chat of yours, or with `worktree: own` a chat of its own, which you do not hear from unless you `subscribe`." },
+                    "worktree": { "type": "string", "enum": ["shared", "own"], "description": "`shared` (the default) works in this chat's worktree. `own` gets a fresh worktree from the project's baseline and stays your delegate; commit first and name the commit in `task` if it should start from your work." },
+                    "notify": { "type": "boolean", "description": "Default true. False starts a chat that is not your delegate, which you do not hear from unless you `subscribe`: a side chat of yours, or with `worktree: own` a top-level chat in the user's sidebar. Start a top-level chat only when the user asks for one." },
                     "canDelegate": { "type": "boolean", "description": "Whether the delegate may start delegates of its own. Omit to use the user's setting, which is off unless they turned it on; set it only when the task needs nested delegates." },
                     "clientRequestId": request_id,
                 },
@@ -165,6 +165,32 @@ fn tools(harness: &str) -> Value {
                     "text": { "type": "string", "description": "A written answer, or a note beside the choices." },
                 },
                 "required": ["chatId", "promptId"],
+            },
+        },
+        {
+            "name": "request_env",
+            "description": format!("Ask the user to set environment variables, such as an API key or a setting your code reads. The user types the values on a card in this chat and chooses where to save them for your shell, your runs and later chats. The tool result omits secret values. Waits until the user answers, at most {} minutes. Use this instead of asking for a key in chat or reading one from a file.", longest / 60),
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "reason": { "type": "string", "description": "Why you need them, in a sentence the user reads on the card." },
+                    "variables": {
+                        "type": "array",
+                        "maxItems": env_request::MAX_VARIABLES,
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "name": { "type": "string", "description": "The variable's name, such as `WANDB_API_KEY`." },
+                                "description": { "type": "string", "description": "What it is and where the user finds it, such as \"From wandb.ai/authorize\". Saved with the variable." },
+                                "secret": { "type": "boolean", "description": "Default true. False for a setting that is not sensitive, such as a project name: the user sees it as typed and you are told its value." },
+                                "pattern": { "type": "string", "description": "Optional regex the value should match, such as `^[0-9a-f]{40}$`. A value that does not match only gets a warning." },
+                                "example": { "type": "string", "description": "Optional placeholder showing the value's form, never a real value." },
+                            },
+                            "required": ["name"],
+                        },
+                    },
+                },
+                "required": ["variables"],
             },
         },
         {
@@ -357,8 +383,13 @@ async fn call(
             let pending = delegation::pending_prompt(&store, &target.id)?
                 .filter(|pending| pending.id == prompt_id)
                 .ok_or_else(|| anyhow!("Chat `{}` has no open question `{prompt_id}`; call `status` for its current one.", target.id))?;
-            if pending.kind() != "question" {
-                bail!("Only the user can approve a step; `answer` answers questions.");
+            match pending.kind() {
+                "question" => {}
+                "env" => bail!(
+                    "Only the user can set the variables chat `{}` asks for.",
+                    target.id
+                ),
+                _ => bail!("Only the user can approve a step; `answer` answers questions."),
             }
             let choices: Vec<String> = args
                 .get("choices")
@@ -392,9 +423,28 @@ async fn call(
                     note,
                     annotations: Vec::new(),
                     from: Some(caller.id.clone()),
+                    env: Vec::new(),
                 })
                 .await?;
             Ok(format!("Answered chat `{}`; it continues.", target.id))
+        }
+        "request_env" => {
+            let variables = env_request::parse_variables(args)?;
+            if let Some(error) = variables
+                .iter()
+                .find_map(|var| super::env_key_error(&var.name))
+            {
+                bail!("{error}");
+            }
+            state
+                .chat
+                .request_env(
+                    &caller.id,
+                    optional_text(args, "reason").map(str::to_string),
+                    variables,
+                    std::time::Duration::from_secs(longest_wait(&caller.harness)),
+                )
+                .await
         }
         "cancel" => {
             let store = Store::open()?;
@@ -692,28 +742,14 @@ async fn wait(state: &AppState, caller: &StoredChatSession, args: &Value) -> Res
 
 async fn models(state: &AppState, requested: Option<&str>) -> Result<Vec<model_routes::Model>> {
     let preferences = Store::open()?.ui_state()?;
-    let owned_providers: Vec<String> =
-        if preferences.hidden_agents.iter().any(|id| id == "opencode") {
-            crate::local::local_models::providers()?
-                .into_keys()
-                .chain(crate::local::local_models::read()?.into_keys())
-                .collect()
-        } else {
-            Vec::new()
-        };
     let query = HarnessQuery {
         refresh: None,
         retry: None,
         harness: None,
     };
     let mut catalog = harnesses_payload(state, &query).await;
-    model_routes::filter_agents(
-        &mut catalog,
-        &preferences.hidden_agents,
-        &owned_providers,
-        requested,
-    )
-    .map_err(|error| anyhow!(error))?;
+    model_routes::filter_agents(&mut catalog, &preferences.hidden_agents, requested)
+        .map_err(|error| anyhow!(error))?;
     Ok(model_routes::models(&catalog, &preferences.hidden_models))
 }
 

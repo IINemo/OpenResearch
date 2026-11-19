@@ -994,6 +994,12 @@ fn cancel_pending() {
     }
 }
 
+/// Observe events at the telemetry boundary in an isolated router test, without
+/// enabling network sends or changing the user's telemetry preference.
+#[cfg(test)]
+pub(crate) static TEST_CAPTURE: OnceLock<std::sync::mpsc::Sender<(String, serde_json::Value)>> =
+    OnceLock::new();
+
 /// Queue an event on disk, spawn the send, and register its handle for the
 /// single exit-time flush. Crucially does NOT await the flush window here —
 /// awaiting inline would delay the caller's next `println!` (the "✓ …" success
@@ -1001,6 +1007,14 @@ fn cancel_pending() {
 /// telemetry is disabled. Deliberately not `async` beyond the spawn: nothing to
 /// await.
 pub(crate) fn capture(event: impl Into<String>, extra: serde_json::Value) {
+    #[cfg(test)]
+    let event = {
+        let event = event.into();
+        if let Some(events) = TEST_CAPTURE.get() {
+            let _ = events.send((event.clone(), extra.clone()));
+        }
+        event
+    };
     if let Some(handle) = spawn_event(event, extra) {
         register_pending(handle);
     }
@@ -1146,8 +1160,11 @@ pub(crate) fn capture_chat_session_started(harness: &str) {
     capture("chat_session_started", json!({ "harness": harness }));
 }
 
-pub(crate) fn capture_chat_message_sent(harness: &str) {
-    capture("chat_message_sent", json!({ "harness": harness }));
+pub(crate) fn capture_chat_message_sent(harness: &str, autonomy: crate::local::autonomy::Autonomy) {
+    capture(
+        "chat_message_sent",
+        json!({ "harness": harness, "autonomy": autonomy.id() }),
+    );
 }
 
 pub(crate) fn capture_skill_invoked(skill: &str, source: &str, harness: Option<&str>) {
@@ -1262,6 +1279,73 @@ pub(crate) const FIRST_ACTIONS: [&str; 7] = [
     "create_experiment",
     "open_settings",
 ];
+
+pub(crate) const MODEL_CALLOUT_KINDS: [&str; 2] = ["release", "free"];
+pub(crate) const MODEL_CALLOUT_ACTIONS: [&str; 3] = ["shown", "opened", "dismissed"];
+pub(crate) const MODEL_PICKER_SECTIONS: [&str; 5] = ["free", "favorites", "lab", "older", "search"];
+
+/// `text` as the API's bounded label, which a longer one would fail with the whole batch it rides in.
+fn bounded_label(text: &str) -> Option<&str> {
+    let text = text.trim();
+    (1..=64).contains(&text.chars().count()).then_some(text)
+}
+
+/// `model` as the API accepts a model label: an identifier, never a path or URL, which would fail the whole
+/// batch it rides in. Stricter than the API, as plain ASCII, so a label it passes always passes there.
+fn model_label(model: &str) -> Option<&str> {
+    let model = model.trim();
+    let identifier = (1..=256).contains(&model.len())
+        && model
+            .bytes()
+            .all(|byte| byte.is_ascii_graphic() || byte == b' ')
+        && !model.contains('\\');
+    if !identifier {
+        return None;
+    }
+    let path = (0..model.len())
+        .filter(|&index| index == 0 || b" (:=@/".contains(&model.as_bytes()[index - 1]))
+        .any(|index| {
+            let rest = model[index..].to_ascii_lowercase();
+            ["arn:", "file:", "/", "~", "./", "../"]
+                .iter()
+                .any(|prefix| rest.starts_with(prefix))
+        });
+    (!path).then_some(model)
+}
+
+/// The model button's popup pointing at a newly released model or the feed's free one.
+pub(crate) fn capture_model_callout(kind: &str, action: &str, model: &str, harness: &str) {
+    let (Some(model), Some(harness)) = (model_label(model), bounded_label(harness)) else {
+        return;
+    };
+    if !MODEL_CALLOUT_KINDS.contains(&kind) || !MODEL_CALLOUT_ACTIONS.contains(&action) {
+        return;
+    }
+    capture(
+        "model_callout",
+        json!({ "kind": kind, "action": action, "model": model, "harness": harness }),
+    );
+}
+
+/// A model chosen in the picker, with the section its row was in.
+pub(crate) fn capture_model_picked(
+    section: &str,
+    model: &str,
+    harness: &str,
+    new: bool,
+    free: bool,
+) {
+    let (Some(model), Some(harness)) = (model_label(model), bounded_label(harness)) else {
+        return;
+    };
+    if !MODEL_PICKER_SECTIONS.contains(&section) {
+        return;
+    }
+    capture(
+        "model_picked",
+        json!({ "section": section, "model": model, "harness": harness, "new": new, "free": free }),
+    );
+}
 
 pub(crate) fn capture_onboarding_step_viewed(step: &str) {
     if !ONBOARDING_STEPS.contains(&step) {
@@ -1894,12 +1978,40 @@ mod tests {
             ("project_starter_clicked", "cli_project_starter_clicked"),
             ("first_action", "cli_first_action"),
             ("demo_welcome_choice", "cli_demo_welcome_choice"),
+            ("model_callout", "cli_model_callout"),
+            ("model_picked", "cli_model_picked"),
         ] {
             let p = build_payload(bare, "did", json!({}));
             assert_eq!(
                 p["events"][0]["name"], wire,
                 "`{bare}` must serialize as `{wire}`"
             );
+        }
+    }
+
+    #[test]
+    fn a_model_label_is_an_identifier_the_api_accepts() {
+        for model in [
+            "claude-fable-5-2",
+            "opencode/deepseek-v4.1-flash-free",
+            "openrouter/anthropic/claude-opus-5.5",
+            "opus[1m]",
+        ] {
+            assert_eq!(model_label(model), Some(model));
+        }
+        let long = "m".repeat(257);
+        for path in [
+            "",
+            "/models/llama.gguf",
+            "~/llama",
+            "file:llama",
+            "local//llama",
+            "./llama",
+            "C:\\llama",
+            "llamá",
+            long.as_str(),
+        ] {
+            assert_eq!(model_label(path), None, "{path}");
         }
     }
 
@@ -1944,6 +2056,70 @@ mod tests {
             }
         }
         bytes
+    }
+
+    #[tokio::test]
+    #[ignore = "run by the official-build telemetry gate; destination is loopback"]
+    async fn install_failure_steps_reach_the_collector() {
+        use axum::{http::StatusCode, routing::post, Json, Router};
+        use harness::{InstallStep, SetupAttempt};
+
+        if !crate::config::in_test_child(TELEMETRY_ENV) {
+            return;
+        }
+        assert_eq!(build_channel(), "production");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let host = format!("http://{}", listener.local_addr().unwrap());
+        std::env::set_var("ORX_TELEMETRY_HOST", &host);
+        assert_eq!(telemetry_host(), host);
+        let (sent, mut received) = tokio::sync::mpsc::unbounded_channel();
+        let app = Router::new().route(
+            ANALYTICS_PATH,
+            post(move |Json(payload): Json<serde_json::Value>| {
+                let sent = sent.clone();
+                async move {
+                    for event in payload["events"].as_array().unwrap() {
+                        assert_eq!(event["name"], "cli_harness_setup");
+                        let p = &event["properties"];
+                        if p["outcome"] == "failed" {
+                            sent.send(p["errorExcerpt"].clone()).unwrap();
+                        }
+                    }
+                    StatusCode::ACCEPTED
+                }
+            }),
+        );
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        for (step, expected) in [
+            (None, serde_json::Value::Null),
+            (
+                Some(InstallStep::ReleaseLookup),
+                json!("managed release lookup"),
+            ),
+            (
+                Some(InstallStep::NativeUpdater),
+                json!("native agent updater"),
+            ),
+            (Some(InstallStep::ManagedCopy), json!("managed agent copy")),
+        ] {
+            let attempt = SetupAttempt::new("opencode", "update", "manual");
+            if let Some(step) = step {
+                attempt.set_install_step(step);
+            }
+            attempt.record(
+                "failed",
+                "command",
+                Some("exit_nonzero"),
+                Some(1),
+                Some("private.test/?token=secret"),
+            );
+            let observed = tokio::time::timeout(std::time::Duration::from_secs(5), received.recv())
+                .await
+                .unwrap();
+            assert_eq!(observed, Some(expected));
+        }
+        flush_pending().await;
+        server.abort();
     }
 
     #[tokio::test]
@@ -2139,7 +2315,7 @@ mod tests {
             build_payload(
                 "chat_message_sent",
                 "cli-release-contract-test",
-                json!({ "harness": "codex" }),
+                json!({ "harness": "codex", "autonomy": "copilot" }),
             ),
             build_payload(
                 "chat_retry_started",
@@ -2289,10 +2465,14 @@ mod tests {
         assert_eq!(chat["events"][0]["properties"]["harness"], "codex");
         assert_eq!(property_keys(&chat), vec!["harness"]);
 
-        let message = build_payload("chat_message_sent", "did", json!({ "harness": "codex" }));
+        let message = build_payload(
+            "chat_message_sent",
+            "did",
+            json!({ "harness": "codex", "autonomy": "copilot" }),
+        );
         assert_eq!(message["events"][0]["name"], "cli_chat_message_sent");
-        assert_eq!(message["events"][0]["properties"]["harness"], "codex");
-        assert_eq!(property_keys(&message), vec!["harness"]);
+        assert_eq!(message["events"][0]["properties"]["autonomy"], "copilot");
+        assert_eq!(property_keys(&message), vec!["autonomy", "harness"]);
 
         let skill = build_payload(
             "skill_invoked",
@@ -2392,7 +2572,7 @@ mod tests {
         capture_browser_open_failed(UpLaunchMode::Browser);
         capture_demo_welcome_choice("explore_demo");
         capture_chat_session_started("codex");
-        capture_chat_message_sent("codex");
+        capture_chat_message_sent("codex", crate::local::autonomy::Autonomy::Agentic);
         capture_skill_invoked("reproduce-paper", "slash", Some("codex"));
         capture_experiment_started("run", true, Some("local"));
 

@@ -55,6 +55,7 @@ export function useSignIn() {
   };
 }
 
+/** The status strip's account segment: the avatar and your first name, which pushes the usage segment to the end. */
 export function AccountChip({ onDetails }: { onDetails: () => void }) {
   const workspace = useWorkspace();
   const { owner } = useMachines();
@@ -78,14 +79,18 @@ export function AccountChip({ onDetails }: { onDetails: () => void }) {
   const reason = accountErrorMessage(accountQuery.error);
   const stateLabel = accountQuery.error instanceof OpenResearchAccountError && accountQuery.error.kind === "offline" ? m.account_offline_label() : m.account_error_label();
   const label = user ? name : reason ? stateLabel : accountQuery.isLoading ? m.common_checking() : m.settings_sign_in();
-  const chipClass = "flex min-h-[44.5px] min-w-0 grow basis-36 items-center gap-2 rounded-md px-1.5 py-1.5 text-start hover:bg-surface focus-visible:outline-2 focus-visible:outline-focus";
-  const contents = <><span className="flex size-7 shrink-0 items-center justify-center rounded-full bg-panel text-sm font-medium text-text" aria-hidden="true">{user ? name.trim().charAt(0).toLocaleUpperCase() : <UserRound size={16} />}</span><span className="flex min-w-0 flex-col"><span dir="auto" className="truncate text-sm leading-tight">{label}</span>{user && <span className="truncate text-xs leading-tight text-subtext">{reason ? stateLabel : user.alphaxivUrl ? "alphaXiv" : "OpenResearch"}</span>}</span></>;
+  const shownName = user ? user.firstName || name : label;
+  const chipClass = "flex h-9 min-w-0 flex-1 items-center gap-2 rounded-md ps-1.5 pe-2 text-start hover:bg-surface data-popup-open:bg-surface focus-visible:outline-2 focus-visible:outline-focus";
+  const contents = <>
+    <span className="flex size-5 shrink-0 items-center justify-center rounded-full bg-panel text-2xs font-medium text-text" aria-hidden="true">{user ? name.trim().charAt(0).toLocaleUpperCase() : <UserRound size={13} />}</span>
+    <span dir="auto" className="truncate text-sm text-text">{shownName}</span>
+  </>;
 
   return user || reason ? <Menu.Root modal={false} loopFocus>
       <Menu.Trigger ref={chipRef} aria-label={`${label}${user && reason ? ` · ${stateLabel}` : ""} · ${m.account_menu()}`} className={chipClass}>{contents}</Menu.Trigger>
       <Menu.Portal container={portalContainer}><Menu.Positioner side="top" align="start" sideOffset={6} collisionPadding={8} className="z-50">
         <Menu.Popup aria-label={m.account_menu()} className="outline-none max-h-(--available-height) overflow-y-auto w-64 max-w-[calc(100vw-1rem)] rounded-lg border border-border bg-background p-1.5 shadow-menu">
-          <div className="flex flex-col gap-1 border-b border-border-variant px-2 py-2 text-sm break-words">{user && <OpenResearchAccount user={user} />}{reason && <span role="status">{reason}</span>}</div>
+          <div className="flex flex-col gap-1 border-b border-border-variant px-2 py-2 text-sm break-words">{user && <OpenResearchAccount user={user} />}{user && <span className="text-xs text-subtext">{user.alphaxivUrl ? "alphaXiv" : "OpenResearch"}</span>}{reason && <span role="status">{reason}</span>}</div>
           {reason && <Menu.Item nativeButton render={<MenuItem className="data-highlighted:bg-surface" />} onClick={() => void accountQuery.refetch()}>{m.settings_check_again()}</Menu.Item>}
           {user && !accountQuery.isError && alphaXivNotConnected && <Menu.Item nativeButton render={<MenuItem className="data-highlighted:bg-surface" />} onClick={() => signIn(true)}>{m.library_connect()}</Menu.Item>}
           <Menu.Item nativeButton render={<MenuItem className="data-highlighted:bg-surface" />} onClick={onDetails}>{m.account_details()}</Menu.Item>

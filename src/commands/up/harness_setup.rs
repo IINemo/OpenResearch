@@ -10,7 +10,8 @@ use serde_json::{json, Value};
 
 use super::{bad_request, AppState};
 use crate::local::harness::managed;
-use crate::telemetry::harness::SetupAttempt;
+use crate::store::human_bytes;
+use crate::telemetry::harness::{InstallStep, SetupAttempt, MANAGED_INSTALL, MANAGED_LOOKUP};
 
 mod sign_in;
 pub(super) use sign_in::SignInPage;
@@ -65,18 +66,17 @@ pub(super) async fn commands() -> Json<Value> {
 pub(super) enum Action {
     Install,
     Login,
+    /// Dashboards that offered OpenCode's move to 2.x sent `upgrade`, which is an update now.
+    #[serde(alias = "upgrade")]
     Update,
-    /// OpenCode only: from 1.x to 2.x.
-    Upgrade,
 }
 
 impl Action {
-    /// The ingestion schema knows three actions; a major upgrade is an update.
     fn label(self) -> &'static str {
         match self {
             Self::Install => "install",
             Self::Login => "login",
-            Self::Update | Self::Upgrade => "update",
+            Self::Update => "update",
         }
     }
 }
@@ -143,9 +143,6 @@ pub(super) async fn connect(
     }
     if !profile_allowed(&request) {
         return bad_request("Unknown agent account").into_response();
-    }
-    if matches!(request.action, Action::Upgrade) && request.harness != "opencode" {
-        return bad_request("Only OpenCode upgrades to a new major version").into_response();
     }
     if request.trigger == Trigger::Automatic
         && (request.harness != "opencode" || !matches!(request.action, Action::Install))
@@ -220,7 +217,7 @@ async fn run(
     // binary where there was none; login/update need no baseline.
     let installed_before = match request.action {
         Action::Install => was_installed(&request.harness).await,
-        Action::Login | Action::Update | Action::Upgrade => true,
+        Action::Login | Action::Update => true,
     };
     if request.trigger == Trigger::Automatic {
         let payload = super::harnesses_payload(
@@ -246,18 +243,16 @@ async fn run(
         && !matches!(request.action, Action::Login)
     {
         run_command = false;
-        attempt.record("command_started", "command", None, None, None);
-        command_failure = managed_setup(socket, request, attempt, size, follow_up).await?;
+        let command = managed_setup(socket, request, attempt, size, follow_up, &state.agent);
+        command_failure = attempt.command(command).await?;
     }
     if run_command {
         let (program, mut args) = match request.action {
             Action::Install => return Err("Agent installation requires a managed release".into()),
-            Action::Login | Action::Update | Action::Upgrade => {
-                let Some(harness) = crate::local::harness::detect_harness(&request.harness).await
-                else {
-                    attempt.record("failed", "detect", Some("not_installed"), None, None);
-                    return Err("Agent not found. Install it, then retry.".into());
-                };
+            Action::Login | Action::Update => {
+                let harness = crate::local::harness::detect_harness(&request.harness).await;
+                let harness =
+                    harness.ok_or_else(|| SetupBlock::NoDetection.record(attempt, "detect"))?;
                 if request.harness == "claude-code"
                     && matches!(request.action, Action::Login)
                     && request.profile.is_none()
@@ -266,25 +261,30 @@ async fn run(
                     attempt.record("interrupted", "detect", Some("not_eligible"), None, None);
                     return Err("Claude Code account login is not applicable to the reported provider or auth state. Check its provider configuration and re-check the harness.".into());
                 }
-                let Some(bin) = harness.bin_path else {
-                    attempt.record("failed", "detect", Some("not_installed"), None, None);
-                    return Err("Agent not found. Install it, then retry.".into());
-                };
-                let (_, args) = if matches!(request.action, Action::Login) {
+                let bin =
+                    setup_program(&harness).map_err(|error| error.record(attempt, "detect"))?;
+                let (_, mut args) = if matches!(request.action, Action::Login) {
                     login_command(&request.harness)
                 } else {
                     update_command(&request.harness)
                 }
                 .unwrap();
-                (bin, args)
+                // Codex's page signs in through a server on this machine's localhost, which a
+                // browser on the laptop cannot reach; a code typed on its page signs in anywhere.
+                let browser_elsewhere = state.remote_instance_id.is_some()
+                    || std::env::var_os("SSH_CONNECTION").is_some();
+                if request.harness == "codex"
+                    && matches!(request.action, Action::Login)
+                    && browser_elsewhere
+                {
+                    args.push("--device-auth".into());
+                }
+                (bin.to_owned(), args)
             }
         };
         let lease = if request.harness == "opencode" && matches!(request.action, Action::Login) {
             let prepared = async {
                 let binary = crate::local::opencode::resolve_binary().await?;
-                if binary.protocol != crate::local::opencode::Protocol::V2 {
-                    return Ok::<_, crate::error::Error>(None);
-                }
                 let db = crate::local::native_store::prepare_opencode(
                     crate::local::native_store::NativeStore::Isolated,
                 )?;
@@ -331,15 +331,11 @@ async fn run(
             env.extend(MANAGED_ENV.map(|(key, value)| (key, value.into())));
         }
         if let Some(profile) = &request.profile {
-            match crate::local::agent_profiles::login_env(profile) {
-                Ok(profile_env) => env.extend(profile_env),
-                Err(error) => {
-                    attempt.record("failed", "detect", Some("not_installed"), None, None);
-                    return Err(error.to_string());
-                }
-            }
+            env.extend(
+                crate::local::agent_profiles::login_env(profile)
+                    .map_err(|error| SetupBlock::Profile(error).record(attempt, "detect"))?,
+            );
         }
-        attempt.record("command_started", "command", None, None, None);
         let login = matches!(request.action, Action::Login);
         let mut screen = TerminalScreen {
             completed: (login && request.harness == "antigravity")
@@ -348,7 +344,7 @@ async fn run(
                 .then(|| SignInPage::for_login(&request.harness))
                 .flatten(),
         };
-        let (status, output) = run_in_terminal(
+        let command = run_in_terminal(
             socket,
             attempt,
             size,
@@ -356,8 +352,8 @@ async fn run(
             (program, args),
             env,
             &mut screen,
-        )
-        .await?;
+        );
+        let (status, output) = attempt.command(command).await?;
         command_failure = match screen.sign_in.as_ref().and_then(SignInPage::failure) {
             Some(message) => Some(CommandFailure {
                 message: message.to_string(),
@@ -379,8 +375,10 @@ async fn run(
             );
             return Err(failure.message);
         }
+        let harness = harness.ok_or_else(|| SetupBlock::NoDetection.record(attempt, "verify"))?;
+        setup_program(&harness).map_err(|error| error.record(attempt, "verify"))?;
         attempt.record("succeeded", "verify", None, None, None);
-        return harness.ok_or_else(|| "Agent not found. Install it, then retry.".into());
+        return Ok(harness);
     }
     let verified = setup_verified(request, harness.as_ref());
     if let Some(failure) = command_failure {
@@ -413,7 +411,7 @@ async fn run(
         attempt.record("succeeded", "verify", None, None, None);
         return Ok(harness);
     }
-    let (reason, detail) = verify_reason(harness.as_ref());
+    let (reason, detail) = verify_reason(request.action, harness.as_ref());
     attempt.record("failed", "verify", Some(reason), None, Some(detail));
     Err(harness
         .and_then(|h| h.agent_note)
@@ -531,39 +529,28 @@ async fn managed_setup(
     attempt: &SetupAttempt,
     size: &mut PtySize,
     follow_up: &mut FollowUp,
+    opencode_host: &crate::local::opencode::AgentHost,
 ) -> Result<Option<CommandFailure>, String> {
-    let _setup = managed::lock_installations().map_err(|error| error.to_string())?;
+    let _setup = wait_for_installations(socket, attempt).await?;
     let harness = request.harness.as_str();
     let user = managed::user_install(harness).await;
     let copy = managed::installed(harness);
-    // Installing or upgrading OpenCode means OpenCode 2, whichever major the user runs.
-    let major = (harness == "opencode").then(|| match request.action {
-        Action::Install | Action::Upgrade => 2,
-        Action::Login | Action::Update => following_major(
-            user.as_ref().map(|(_, version)| version),
-            copy.as_ref().map(|(_, version)| version),
-        ),
-    });
-    if let (Action::Upgrade, Some((bin, version))) = (request.action, &user) {
-        if version.major < 2 {
-            return upgrade_own_opencode(socket, attempt, size, follow_up, bin).await;
-        }
-    }
-    let release = managed::latest(harness, major).await;
+    attempt.set_install_step(InstallStep::ReleaseLookup);
+    let release = managed::latest(harness).await;
     if let (Some((_, version)), Ok(release)) = (&user, &release) {
         if *version >= release.version {
             attempt.record("command_completed", "command", None, Some(0), None);
             return Ok(None);
         }
     }
-    let own_major = |version: &semver::Version| major.is_none_or(|major| version.major == major);
     if let (Action::Update, Some((bin, _))) = (
         request.action,
         user.as_ref()
-            .filter(|(_, version)| own_major(version) && runs_own_updater(harness, version)),
+            .filter(|(_, version)| runs_own_updater(harness, version)),
     ) {
         let (_, args) = update_command(harness).expect("the selected agent has an updater");
         let program = bin.to_string_lossy().into_owned();
+        attempt.set_install_step(InstallStep::NativeUpdater);
         let (status, output) = run_in_terminal(
             socket,
             attempt,
@@ -587,7 +574,7 @@ async fn managed_setup(
     }
     let release = match release {
         Ok(release) => release,
-        Err(error) => return Ok(Some(install_failure(error))),
+        Err(error) => return Ok(Some(install_failure(MANAGED_LOOKUP, error))),
     };
     if let Some((bin, version)) = &copy {
         if current_copy(version, &release) && managed::verify(harness, bin, version).await.is_ok() {
@@ -595,12 +582,14 @@ async fn managed_setup(
             return Ok(None);
         }
     }
-    match install_with_progress(socket, harness, &release).await {
+    let host = (harness == "opencode").then_some(opencode_host);
+    attempt.set_install_step(InstallStep::ManagedCopy);
+    match install_with_progress(socket, harness, &release, host).await {
         Some(Ok(_)) => {
             attempt.record("command_completed", "command", None, Some(0), None);
             Ok(None)
         }
-        Some(Err(error)) => Ok(Some(install_failure(error))),
+        Some(Err(error)) => Ok(Some(install_failure(MANAGED_INSTALL, error))),
         None => {
             attempt.record("interrupted", "command", Some("disconnected"), None, None);
             Err("Terminal disconnected".into())
@@ -608,59 +597,12 @@ async fn managed_setup(
     }
 }
 
-/// The major OpenCode's copy follows: a 2.x copy stands in for the user's own 1.x
-/// once they chose it, and is never traded back for it.
-fn following_major(user: Option<&semver::Version>, copy: Option<&semver::Version>) -> u64 {
-    match (user, copy) {
-        (Some(user), Some(copy)) => user.major.max(copy.major),
-        (Some(only), None) | (None, Some(only)) => only.major,
-        (None, None) => 2,
-    }
-}
-
-/// The user's own OpenCode 1 moves itself to OpenCode 2 with its own updater, which
-/// answers a method it can't handle (Homebrew, Scoop) with instructions and a clean exit.
-async fn upgrade_own_opencode(
-    socket: &mut WebSocket,
-    attempt: &SetupAttempt,
-    size: &mut PtySize,
-    follow_up: &mut FollowUp,
-    bin: &std::path::Path,
-) -> Result<Option<CommandFailure>, String> {
-    let args = vec!["upgrade".to_string(), "--major".to_string()];
-    let (status, output) = run_in_terminal(
-        socket,
-        attempt,
-        size,
-        follow_up,
-        (bin.to_string_lossy().into_owned(), args),
-        Vec::new(),
-        &mut TerminalScreen::default(),
-    )
-    .await?;
-    let moved = managed::user_install("opencode")
-        .await
-        .is_some_and(|(_, version)| version.major >= 2);
-    if moved {
-        return Ok(completed_or_failure(attempt, status, output));
-    }
-    Ok(Some(CommandFailure {
-        message: "OpenCode's own updater couldn't move it to OpenCode 2.".into(),
-        exit_code: if status.success() {
-            1
-        } else {
-            status.exit_code()
-        },
-        output,
-    }))
-}
-
 /// The terminal prints the attempt's error itself, once the attempt ends.
-fn install_failure(error: crate::error::Error) -> CommandFailure {
+fn install_failure(step: &'static str, error: crate::error::Error) -> CommandFailure {
     let message = format!("{error:#}");
     CommandFailure {
         exit_code: 1,
-        output: message.clone(),
+        output: format!("{step}: {message}"),
         message,
     }
 }
@@ -671,6 +613,7 @@ async fn install_with_progress(
     socket: &mut WebSocket,
     harness: &str,
     release: &managed::Release,
+    opencode_host: Option<&crate::local::opencode::AgentHost>,
 ) -> Option<crate::error::Result<std::path::PathBuf>> {
     let name = crate::local::harness::chat_harness(harness)
         .map_or_else(|| harness.to_string(), |h| h.name().to_string());
@@ -687,10 +630,9 @@ async fn install_with_progress(
     let mut progress = move |done: u64, total: Option<u64>| {
         let _ = sender.send((done, total));
     };
-    let install = managed::install(harness, release, &mut progress);
+    let install = managed::install(harness, release, &mut progress, opencode_host);
     tokio::pin!(install);
     let mut tick = tokio::time::interval(std::time::Duration::from_millis(250));
-    let megabytes = |bytes: u64| format!("{:.1} MB", bytes as f64 / 1e6);
     loop {
         tokio::select! {
             result = &mut install => {
@@ -708,8 +650,8 @@ async fn install_with_progress(
                 let (done, total) = *received.borrow_and_update();
                 let line = match total {
                     Some(total) if done >= total => "Checking and unpacking…".to_string(),
-                    Some(total) => format!("{} of {}", megabytes(done), megabytes(total)),
-                    None => megabytes(done),
+                    Some(total) => format!("{} of {}", human_bytes(done), human_bytes(total)),
+                    None => human_bytes(done),
                 };
                 write_terminal(socket, &format!("\r\x1b[2K{line}")).await.ok()?;
                 write_progress(socket, done, total).await.ok()?;
@@ -721,6 +663,67 @@ async fn install_with_progress(
             }
         }
     }
+}
+
+/// The installations lock, once another install, removal or background update lets go of it.
+/// Ending without it ends the attempt, so this records why.
+async fn wait_for_installations(
+    socket: &mut WebSocket,
+    attempt: &SetupAttempt,
+) -> Result<crate::file_lock::FileLock, String> {
+    let lock_failed = |error: crate::error::Error| {
+        let message = format!("{error:#}");
+        // The ingestion contract has no lock reason; spawn_failed is the nearest pre-command fault.
+        attempt.record(
+            "failed",
+            "command",
+            Some("spawn_failed"),
+            None,
+            Some(&message),
+        );
+        message
+    };
+    let disconnected = || {
+        attempt.record("interrupted", "command", Some("disconnected"), None, None);
+        "The install was cancelled.".to_string()
+    };
+    if let Some(lock) = managed::try_lock_installations().map_err(lock_failed)? {
+        return Ok(lock);
+    }
+    // The terminal line is for dashboards that predate the queue frame.
+    if write_queue(socket, true).await.is_err()
+        || write_terminal(
+            socket,
+            "Waiting for another agent install or update to finish…\r\n",
+        )
+        .await
+        .is_err()
+    {
+        return Err(disconnected());
+    }
+    loop {
+        tokio::select! {
+            _ = tokio::time::sleep(crate::config::paced(std::time::Duration::from_millis(250))) => {
+                if let Some(lock) = managed::try_lock_installations().map_err(lock_failed)? {
+                    if write_queue(socket, false).await.is_err() {
+                        return Err(disconnected());
+                    }
+                    return Ok(lock);
+                }
+            }
+            message = socket.recv() => {
+                if matches!(message, None | Some(Err(_)) | Some(Ok(Message::Close(_)))) {
+                    return Err(disconnected());
+                }
+            }
+        }
+    }
+}
+
+/// Whether the attempt is queued behind another install, for the dialog's status line.
+async fn write_queue(socket: &mut WebSocket, waiting: bool) -> Result<(), axum::Error> {
+    let frame = json!({ "type": "queue", "waiting": waiting });
+    socket.send(Message::Text(frame.to_string().into())).await
 }
 
 /// The same progress as data, for a client that draws a progress bar in place of the terminal.
@@ -749,7 +752,10 @@ const UPDATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10 * 
 /// is updated once it falls behind, and orx's copy stands in when that fails or
 /// the install doesn't run. An agent the user never installed is left alone.
 /// Returns whether the binary in use changed.
-pub(super) async fn keep_current(harness: &'static str) -> crate::error::Result<bool> {
+pub(super) async fn keep_current(
+    harness: &'static str,
+    opencode_host: &crate::local::opencode::AgentHost,
+) -> crate::error::Result<bool> {
     let _setup = managed::lock_installations()?;
     if !matches!(harness, "claude-code" | "codex" | "opencode")
         && managed::installed(harness).is_none()
@@ -758,19 +764,22 @@ pub(super) async fn keep_current(harness: &'static str) -> crate::error::Result<
     }
     let user = managed::user_install(harness).await;
     let copy = managed::installed(harness);
-    if user.is_none() && copy.is_none() && !managed::user_install_broken(harness).await {
+    if harness != "opencode"
+        && user.is_none()
+        && copy.is_none()
+        && !managed::user_install_broken(harness).await
+    {
         return Ok(false);
     }
-    let major = (harness == "opencode").then(|| {
-        following_major(
-            user.as_ref().map(|(_, version)| version),
-            copy.as_ref().map(|(_, version)| version),
-        )
-    });
-    let release = managed::latest(harness, major).await?;
-    // The user's own install of another major is theirs to keep; it stands
-    // neither for nor against orx's copy.
-    let user = user.filter(|(_, version)| major.is_none_or(|major| version.major == major));
+    // Not even the user's own updater may swap OpenCode under a running turn.
+    let mut swap = None;
+    if harness == "opencode" {
+        match managed::OPENCODE_IN_USE.try_write() {
+            Ok(guard) => swap = Some(guard),
+            Err(_) => return Ok(false),
+        }
+    }
+    let release = managed::latest(harness).await?;
     if let Some((bin, version)) = &user {
         if *version >= release.version {
             managed::remove_all(harness).await;
@@ -811,7 +820,15 @@ pub(super) async fn keep_current(harness: &'static str) -> crate::error::Result<
             return Ok(false);
         }
     }
-    managed::install(harness, &release, &mut |_, _| {}).await?;
+    // `install` takes its own guard.
+    drop(swap);
+    managed::install(
+        harness,
+        &release,
+        &mut |_, _| {},
+        (harness == "opencode").then_some(opencode_host),
+    )
+    .await?;
     Ok(true)
 }
 
@@ -825,7 +842,7 @@ fn runs_own_updater(harness: &str, version: &semver::Version) -> bool {
     }
 }
 
-/// A copy of another major is no stand-in: OpenCode's majors speak different protocols.
+/// A copy of another major is no stand-in for the newest release.
 fn current_copy(copy: &semver::Version, release: &managed::Release) -> bool {
     copy.major == release.version.major && *copy >= release.version
 }
@@ -852,17 +869,61 @@ async fn was_installed(harness: &str) -> bool {
         .is_some_and(|h| h.installed && h.bin_path.is_some())
 }
 
+/// Only the fixed diagnosis goes on the wire. A failed profile preparation can name
+/// a private local path in the message shown to the user.
+#[derive(Debug)]
+enum SetupBlock {
+    NoDetection,
+    NotInstalled,
+    NoPath,
+    Profile(crate::error::Error),
+}
+
+impl SetupBlock {
+    fn diagnostic(&self) -> (&'static str, &'static str) {
+        match self {
+            Self::NoDetection => ("not_ready", "agent detection returned no result"),
+            Self::NotInstalled => ("not_installed", "agent is not installed"),
+            Self::NoPath => ("not_ready", "agent executable path is unavailable"),
+            Self::Profile(_) => ("not_ready", "agent account could not be prepared"),
+        }
+    }
+
+    fn record(self, attempt: &SetupAttempt, stage: &str) -> String {
+        let (reason, detail) = self.diagnostic();
+        attempt.record("failed", stage, Some(reason), None, Some(detail));
+        match self {
+            Self::NoDetection => "Could not check the agent. Re-check your coding agents, then retry.".into(),
+            Self::NotInstalled => "Agent not found. Install it, then retry.".into(),
+            Self::NoPath => "Could not locate the installed agent's executable. Re-check your coding agents, then retry.".into(),
+            Self::Profile(error) => error.to_string(),
+        }
+    }
+}
+
+fn setup_program(harness: &crate::local::harness::HarnessInfo) -> Result<&str, SetupBlock> {
+    harness.bin_path.as_deref().ok_or(if harness.installed {
+        SetupBlock::NoPath
+    } else {
+        SetupBlock::NotInstalled
+    })
+}
+
 /// The ingested reason, plus a fixed phrase naming which predicate failed —
 /// `not_ready` alone cannot tell a stale executable from a signed-out CLI.
 /// The phrase is one of `safe_error_excerpt`'s allowlisted literals, so it
 /// classifies without widening the ingestion schema or leaking local text.
 fn verify_reason(
+    action: Action,
     harness: Option<&crate::local::harness::HarnessInfo>,
 ) -> (&'static str, &'static str) {
     use crate::local::harness::HarnessAuthState;
-    let Some(h) = harness.filter(|h| h.installed) else {
-        return ("not_installed", "agent is not installed");
+    let Some(h) = harness else {
+        return SetupBlock::NoDetection.diagnostic();
     };
+    if !h.installed {
+        return SetupBlock::NotInstalled.diagnostic();
+    }
     if h.install_broken {
         return ("not_ready", "agent is installed but failed to run");
     }
@@ -874,16 +935,25 @@ fn verify_reason(
     match h.auth_state {
         HarnessAuthState::NeedsLogin => ("not_ready", "agent is not signed in"),
         // A credential the harness will actually send could not be verified.
-        HarnessAuthState::Unknown => ("not_ready", "agent sign-in could not be verified"),
+        HarnessAuthState::Unknown => (
+            "not_ready",
+            h.cursor_status_error
+                .map_or("agent sign-in could not be verified", |cause| {
+                    cause.excerpt()
+                }),
+        ),
         HarnessAuthState::Unsupported => ("not_ready", "agent version is unsupported"),
+        HarnessAuthState::Ready if matches!(action, Action::Login) && !h.authenticated => {
+            ("not_ready", "agent is not signed in")
+        }
         HarnessAuthState::Ready if !h.agent_ready => ("not_ready", "agent has no usable model"),
         HarnessAuthState::Ready => ("not_ready", "agent reported no usable state"),
     }
 }
 
 /// The OS cause of a spawn failure, with the command line stripped. The error
-/// reads `CreateProcessW "powershell.exe …<whole script>…" failed: <cause>`;
-/// only the text after the final `failed:` describes what the OS refused.
+/// reads `CreateProcessW "<program> …<arguments>…" failed: <cause>`; only the
+/// text after the final `failed:` describes what the OS refused.
 fn spawn_failure_cause(error: &str) -> String {
     error
         .rsplit_once("failed:")
@@ -922,11 +992,6 @@ fn setup_verified(
             h.version.is_some()
                 && h.auth_state != crate::local::harness::HarnessAuthState::Unsupported
         }
-        Action::Upgrade => h
-            .version
-            .as_deref()
-            .and_then(managed::parse)
-            .is_some_and(|version| version.major >= 2),
     }
 }
 
@@ -948,6 +1013,19 @@ mod tests {
 
     use super::*;
 
+    #[test]
+    fn managed_failure_keeps_its_step_without_sending_the_local_error() {
+        let private = "local-only vendor detail /private/person/vendor?token=private";
+        for step in [MANAGED_LOOKUP, MANAGED_INSTALL] {
+            let failure = install_failure(step, crate::error::anyhow!(private));
+            assert_eq!(failure.message, private);
+            assert_eq!(
+                crate::telemetry::harness::excerpt_for_test(&failure.output).as_deref(),
+                Some(step)
+            );
+        }
+    }
+
     #[tokio::test]
     async fn every_preset_has_a_managed_install_without_a_command() {
         let Json(payload) = commands().await;
@@ -964,6 +1042,63 @@ mod tests {
             assert!(payload[id]["managedFrom"].is_string());
             assert_eq!(payload[id]["install"], "");
         }
+    }
+
+    #[tokio::test]
+    async fn an_install_behind_another_says_it_waits_and_ends_however_the_wait_does() {
+        // The install lock is one file per config directory; a child keeps its own.
+        if !crate::config::in_test_child(&[]) {
+            return;
+        }
+        use futures::StreamExt;
+        use tokio_tungstenite::tungstenite::Message as Frame;
+        let (results, mut waited) = tokio::sync::mpsc::unbounded_channel();
+        let app = axum::Router::new().route(
+            "/",
+            axum::routing::get(move |ws: WebSocketUpgrade| {
+                let results = results.clone();
+                async move {
+                    ws.on_upgrade(move |mut socket| async move {
+                        let attempt = SetupAttempt::new("opencode", "install", "manual");
+                        let lock = wait_for_installations(&mut socket, &attempt).await;
+                        let _ = results.send(lock.map(drop));
+                    })
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}/", listener.local_addr().unwrap());
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let queue = |waiting: bool| {
+            Frame::Text(
+                json!({"type": "queue", "waiting": waiting})
+                    .to_string()
+                    .into(),
+            )
+        };
+
+        let held = managed::lock_installations().unwrap();
+        let (mut client, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        assert_eq!(client.next().await.unwrap().unwrap(), queue(true));
+        assert!(client.next().await.unwrap().unwrap().is_binary());
+        drop(held);
+        assert_eq!(client.next().await.unwrap().unwrap(), queue(false));
+        assert_eq!(waited.recv().await.unwrap(), Ok(()));
+
+        let held = managed::lock_installations().unwrap();
+        let (mut client, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        assert_eq!(client.next().await.unwrap().unwrap(), queue(true));
+        client.close(None).await.unwrap();
+        assert!(waited.recv().await.unwrap().is_err());
+        drop(held);
+
+        let config = crate::config::config_dir();
+        std::fs::remove_dir_all(&config).unwrap();
+        std::fs::write(&config, "").unwrap();
+        let _client = tokio_tungstenite::connect_async(&url).await.unwrap();
+        let error = waited.recv().await.unwrap().unwrap_err();
+        assert!(error.contains(&config.display().to_string()), "{error}");
+        server.abort();
     }
 
     #[test]
@@ -1029,6 +1164,10 @@ mod tests {
         request.trigger = Trigger::Manual;
         request.action = Action::Login;
         assert!(!setup_verified(&request, Some(&h)));
+        assert_eq!(
+            verify_reason(request.action, Some(&h)),
+            ("not_ready", "agent is not signed in")
+        );
         h.authenticated = true;
         assert!(setup_verified(&request, Some(&h)));
         request.action = Action::Update;
@@ -1056,6 +1195,7 @@ mod tests {
             login_eligible: false,
             auth_check_failed: false,
             auth_observation: None,
+            cursor_status_error: None,
             claude_ultracode: false,
             account: None,
             account_name: None,
@@ -1076,44 +1216,45 @@ mod tests {
             configured_model: None,
             models: Vec::new(),
             options: crate::local::harness::HarnessOptions::none(),
+            found_providers: Vec::new(),
         }
     }
 
     #[test]
     fn verify_reason_names_the_failed_predicate() {
         use crate::local::harness::HarnessAuthState as State;
+        fn reason(h: Option<&crate::local::harness::HarnessInfo>) -> (&'static str, &'static str) {
+            verify_reason(Action::Install, h)
+        }
         let mut h = blank_harness();
-        assert_eq!(verify_reason(None).0, "not_installed");
-        assert_eq!(verify_reason(Some(&h)).0, "not_installed");
+        assert_eq!(
+            reason(None),
+            ("not_ready", "agent detection returned no result")
+        );
+        assert_eq!(reason(Some(&h)).0, "not_installed");
         h.installed = true;
         h.install_broken = true;
         assert_eq!(
-            verify_reason(Some(&h)),
+            reason(Some(&h)),
             ("not_ready", "agent is installed but failed to run")
         );
         h.install_broken = false;
         h.auth_state = State::NeedsLogin;
-        assert_eq!(verify_reason(Some(&h)).1, "agent is not signed in");
+        assert_eq!(reason(Some(&h)).1, "agent is not signed in");
         // The API/OAuth conflict: distinguishable from a plain signed-out CLI.
         h.auth_state = State::Unknown;
-        assert_eq!(
-            verify_reason(Some(&h)).1,
-            "agent sign-in could not be verified"
-        );
+        assert_eq!(reason(Some(&h)).1, "agent sign-in could not be verified");
         h.auth_state = State::Unsupported;
-        assert_eq!(verify_reason(Some(&h)).1, "agent version is unsupported");
+        assert_eq!(reason(Some(&h)).1, "agent version is unsupported");
         // A refused database also reports Unsupported; it is not a stale install.
         h.needs_config_repair = true;
-        assert_eq!(
-            verify_reason(Some(&h)).1,
-            "agent configuration needs repair"
-        );
+        assert_eq!(reason(Some(&h)).1, "agent configuration needs repair");
         h.needs_config_repair = false;
         // Installed, signed in, but OpenCode has no usable model configured.
         h.auth_state = State::Ready;
-        assert_eq!(verify_reason(Some(&h)).1, "agent has no usable model");
+        assert_eq!(reason(Some(&h)).1, "agent has no usable model");
         h.agent_ready = true;
-        assert_eq!(verify_reason(Some(&h)).1, "agent reported no usable state");
+        assert_eq!(reason(Some(&h)).1, "agent reported no usable state");
     }
 
     /// `verify_reason` is the one site that computes a reason rather than
@@ -1138,7 +1279,7 @@ mod tests {
                         h.install_broken = broken;
                         h.agent_ready = ready;
                         h.needs_config_repair = repair;
-                        let (reason, detail) = verify_reason(Some(&h));
+                        let (reason, detail) = verify_reason(Action::Install, Some(&h));
                         assert!(contract::REASONS.contains(&reason), "{reason}");
                         let excerpt = crate::telemetry::harness::excerpt_for_test(detail);
                         assert_eq!(excerpt.as_deref(), Some(detail), "{detail}");
@@ -1147,7 +1288,30 @@ mod tests {
                 }
             }
         }
-        assert_eq!(verify_reason(None).0, "not_installed");
+        assert_eq!(
+            verify_reason(Action::Install, None),
+            ("not_ready", "agent detection returned no result")
+        );
+    }
+
+    #[test]
+    fn unverifiable_cursor_status_keeps_only_a_fixed_probe_class() {
+        use crate::local::harness::cursor::CursorStatusError;
+        let mut h = blank_harness();
+        h.id = "cursor".into();
+        h.installed = true;
+        h.auth_state = crate::local::harness::HarnessAuthState::Unknown;
+        for cause in CursorStatusError::ALL {
+            h.cursor_status_error = Some(cause);
+            let (reason, detail) = verify_reason(Action::Login, Some(&h));
+            assert_eq!(reason, "not_ready");
+            assert_eq!(detail, cause.excerpt());
+            let output = format!("account=private@example.org {detail} secret-token");
+            assert_eq!(
+                crate::telemetry::harness::excerpt_for_test(&output).as_deref(),
+                Some(detail)
+            );
+        }
     }
 
     /// Only an install that produced a runnable binary where there was none
@@ -1252,21 +1416,5 @@ mod tests {
         assert!(runs_own_updater("codex", &version("0.126.0")));
         assert!(runs_own_updater("claude-code", &version("2.1.0")));
         assert!(!runs_own_updater("cursor", &version("2026.1.1")));
-    }
-
-    #[test]
-    fn a_chosen_opencode_2_copy_outranks_the_users_own_1() {
-        let version = |text| semver::Version::parse(text).unwrap();
-        assert_eq!(following_major(Some(&version("1.19.5")), None), 1);
-        assert_eq!(
-            following_major(Some(&version("1.19.5")), Some(&version("2.2.5"))),
-            2
-        );
-        assert_eq!(
-            following_major(Some(&version("2.2.5")), Some(&version("1.19.5"))),
-            2
-        );
-        assert_eq!(following_major(None, Some(&version("1.19.4"))), 1);
-        assert_eq!(following_major(None, None), 2);
     }
 }

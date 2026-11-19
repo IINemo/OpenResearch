@@ -112,6 +112,10 @@ enum Command {
     /// Operate on one local experiment node.
     Exp(ExpArgs),
 
+    /// List the agents, accounts and model providers OpenResearch offers, name them, pin logos,
+    /// and add OpenAI-compatible endpoints. Runs from an OpenResearch chat.
+    Agents(AgentsArgs),
+
     /// Print CLI usage for agents, or fetch a skill doc.
     Skill(SkillArgs),
 
@@ -167,6 +171,10 @@ enum Command {
 
     #[command(name = "invocation-gate", hide = true)]
     InvocationGate,
+
+    #[cfg(all(desktop_app, target_os = "linux"))]
+    #[command(name = "check-media", hide = true)]
+    CheckMedia,
 
     /// Internal: orx's stdio MCP server, which every agent harness spawns:
     /// Claude's permission bridge and the orchestration tools, relayed to the
@@ -298,6 +306,18 @@ pub enum ProjectCommand {
         no_artifacts: bool,
     },
 
+    /// From a chat: propose making it a project of its own. The user reviews
+    /// the name and folder in the chat; creating it moves the chat's committed
+    /// work there, and the chat continues in that project.
+    Create {
+        /// The project's name.
+        #[arg(long)]
+        name: String,
+        /// Folder for its code; it must be new or empty (default: ~/OpenResearch/<name>).
+        #[arg(long)]
+        path: Option<String>,
+    },
+
     /// Delete a project's published openresearch.sh link and its file.
     Unpublish { project_id: String },
 
@@ -378,6 +398,15 @@ pub struct ComputeArgs {
     pub json: bool,
     #[command(flatten)]
     pub catalog: commands::compute::CatalogArgs,
+}
+
+#[derive(Args, Debug)]
+pub struct AgentsArgs {
+    #[command(subcommand)]
+    pub command: Option<commands::agents::AgentsCommand>,
+    /// Machine-readable output.
+    #[arg(long, global = true)]
+    pub json: bool,
 }
 
 #[derive(Args, Debug)]
@@ -1174,6 +1203,14 @@ async fn run_cli() {
         Cli::command().print_help().ok();
         return;
     };
+    #[cfg(all(desktop_app, target_os = "linux"))]
+    if matches!(command, Command::CheckMedia) {
+        if let Err(error) = commands::app::media::check() {
+            eprintln!("orx check-media: {error:#}");
+            std::process::exit(1);
+        }
+        return;
+    }
     if ends_with_its_stdout(&command) {
         output::end_when_stdout_closes();
     }
@@ -1438,6 +1475,8 @@ fn should_capture_command(command: &Command) -> bool {
 /// variant name so renames don't silently break analytics continuity.
 fn command_name(command: &Command) -> &'static str {
     match command {
+        #[cfg(all(desktop_app, target_os = "linux"))]
+        Command::CheckMedia => "check-media",
         Command::Login(_) => "login",
         Command::Logout => "logout",
         Command::Alphaxiv(_) => "alphaxiv",
@@ -1453,6 +1492,7 @@ fn command_name(command: &Command) -> &'static str {
         Command::Instance(_) => "instance",
         Command::SshKey(_) => "ssh-key",
         Command::Exp(_) => "exp",
+        Command::Agents(_) => "agents",
         Command::Skill(_) => "skill",
         Command::Skills(_) => "skills",
         Command::Templates(_) => "templates",
@@ -1509,6 +1549,7 @@ async fn dispatch(command: Command) -> error::Result<()> {
             SshKeyCommand::List => commands::ssh_key::list().await,
         },
         Command::Exp(args) => commands::exp::run(args).await,
+        Command::Agents(args) => commands::agents::run(args).await,
         Command::Skill(args) => commands::skill::run(args).await,
         Command::Skills(args) => commands::library::skills(args),
         Command::Templates(args) => commands::library::templates(args),
@@ -1536,6 +1577,8 @@ async fn dispatch(command: Command) -> error::Result<()> {
         Command::InvocationGate => commands::invocation_gate::run().await,
         Command::Mcp => commands::mcp::run().await,
         Command::AntigravityGate => commands::mcp::run_antigravity().await,
+        #[cfg(all(desktop_app, target_os = "linux"))]
+        Command::CheckMedia => unreachable!("handled before dispatch"),
         Command::AlphaxivMcp => unreachable!("handled before dispatch"),
         Command::PublishBranch(_) => unreachable!("handled before dispatch"),
         Command::RemoteHost(_) => unreachable!("handled before dispatch"),
@@ -1548,6 +1591,7 @@ fn command_uses_lifecycle_lock(command: &Command) -> bool {
         Command::Login(_)
             | Command::Logout
             | Command::Alphaxiv(_)
+            | Command::Agents(_)
             | Command::InstallSkills(_)
             | Command::Discover(_)
             | Command::Paper(_)

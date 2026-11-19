@@ -67,7 +67,8 @@ function SentCard({ part, onOpenFile, onOpenRun }: Props) {
   // A message with no sender is orx's own, written only to keep the chat working toward its goal.
   const goal = kind === "message" && !from;
   const chat = kind === "monitoring" || !from ? undefined : links?.chat(from);
-  const sender = kind === "monitoring" || goal
+  // Without a sender, orx itself wrote it.
+  const sender = kind === "monitoring" || !from
     ? m.agent_message_openresearch()
     : chat?.title || m.agent_message_other_chat();
   const icon = kind === "monitoring"

@@ -1,24 +1,51 @@
 import json
 import os
 import socket
+import subprocess
 import sys
 
 sys.stdin.reconfigure(encoding="utf-8")
 sys.stdout.reconfigure(encoding="utf-8")
 
-# A mode may carry the port that signals a stall or holds session/delete.
-mode, _, port = (sys.argv[1] if len(sys.argv) > 1 else "normal").partition(":")
+# A mode may carry a value: the test's port that signals a stall or holds session/delete, as in
+# "slow-delete:4000", or for "replay:<file>" the session updates that answer each prompt, one JSON
+# object a line.
+mode, _, value = (sys.argv[1] if len(sys.argv) > 1 else "normal").partition(":")
 record = sys.argv[2] if len(sys.argv) > 2 else None
 session = "peer-session"
 count = 0
 hanging = None
+children = {}
 startup = "pi v1.5.0\n---\nSkills: none\n"
 # Like pi-acp, the startup modes send a chunk after session/new, before the agent's turn.
 # It goes out when the prompt arrives, so it always reaches the client inside its turn.
 pending = None
+bom = mode == "transport-bom"
 
 
 def send(value):
+    global bom
+    if mode in ["transport-crlf", "transport-fragments", "transport-blank", "transport-noise", "transport-bom"]:
+        encoded = json.dumps(dict(jsonrpc="2.0", **value), ensure_ascii=False).encode("utf-8")
+        if mode == "transport-crlf":
+            encoded += b"\r\n"
+        elif mode == "transport-blank":
+            encoded = b"\n" + encoded + b"\n\n"
+        elif mode == "transport-noise":
+            encoded = b" \r\n[dotenv@17.2.0] injecting env (0)\nnpm notice banner\r\n" + encoded + b"\n\t\n"
+        else:
+            encoded += b"\n"
+        if bom:
+            encoded = b"\xef\xbb\xbf" + encoded
+            bom = False
+        if mode == "transport-fragments":
+            for byte in encoded:
+                sys.stdout.buffer.write(bytes([byte]))
+                sys.stdout.buffer.flush()
+        else:
+            sys.stdout.buffer.write(encoded)
+            sys.stdout.buffer.flush()
+        return
     print(json.dumps(dict(jsonrpc="2.0", **value)), flush=True)
 
 
@@ -44,8 +71,8 @@ def note(method, params):
 
 
 def signal_stall():
-    if port:
-        with socket.create_connection(("127.0.0.1", int(port))):
+    if value:
+        with socket.create_connection(("127.0.0.1", int(value))):
             pass
 
 
@@ -57,8 +84,16 @@ def config(model="first"):
                  options=[dict(group="levels", name="Levels", options=[dict(value="high" if model == "second" else "low", name="Native effort")])])]
 
 
+# A replayed agent records its own arguments, which follow the record path.
+if mode == "replay":
+    note("launch", dict(arguments=sys.argv[3:]))
+
 for line in sys.stdin:
     request = json.loads(line)
+    # orx answers output it could not parse with an error for a null id.
+    if "error" in request and request.get("id") is None:
+        print(f"unexpected error from orx: {line}", file=sys.stderr, flush=True)
+        sys.exit(9)
     method = request.get("method")
     params = request.get("params", {})
     if method:
@@ -77,8 +112,21 @@ for line in sys.stdin:
             assert os.environ["ORX_CHAT_HARNESS"].startswith("acp:")
         assert params["clientCapabilities"]["fs"] == {"readTextFile": True, "writeTextFile": True}
         assert params["clientCapabilities"]["terminal"] is True
+        if mode == "gated-init":
+            with socket.create_connection(("127.0.0.1", int(value))) as gate:
+                gate.recv(1)
+        if mode == "stderr-init":
+            sys.stdout.buffer.write(b"\n")
+            sys.stdout.buffer.flush()
+            final_line = "\u4ee3\u7406 " * (200 if value == "long" else 1) + "final-startup-cause"
+            sys.stderr.buffer.write(b"discarded-prefix:" + b"x" * 65536 + b"\xff" + ("\n" + final_line + "\n").encode("utf-8"))
+            sys.stderr.buffer.flush()
+            sys.exit(7)
         if mode == "crash-init":
             sys.exit(3)
+        if mode == "shapeless-init":
+            reply(request, dict(agentCapabilities={}))
+            continue
         if mode == "stalled-init":
             signal_stall()
             continue
@@ -86,7 +134,7 @@ for line in sys.stdin:
             send(dict(id=request["id"], error=dict(code=-32000, message="Authentication required")))
         else:
             reply(request, dict(protocolVersion=2 if mode == "incompatible" else 1,
-                                agentInfo=dict(name="Deterministic ACP peer", version="1.0"),
+                                agentInfo=dict(name="\u4ee3\u7406\U0001f338" if mode == "transport-fragments" else "Deterministic ACP peer", version="1.0"),
                                 agentCapabilities=dict(loadSession=mode != "no-resume", **({"sessionCapabilities": {"resume": {}}} if mode in ["resume", "alphaxiv-resume"] else {"sessionCapabilities": {"resume": {}, "list": {}}} if mode == "unlisted" else {}),
                                                        **({"sessionCapabilities": {"delete": {}}} if mode in ["delete", "slow-delete"] else {}))))
     elif method == "session/new":
@@ -128,10 +176,18 @@ for line in sys.stdin:
     elif method == "session/delete" and mode in ["delete", "slow-delete"]:
         if mode == "slow-delete":
             # The test answers the delete by closing this connection.
-            with socket.create_connection(("127.0.0.1", int(port))) as hold:
+            with socket.create_connection(("127.0.0.1", int(value))) as hold:
                 hold.recv(1)
             note("answered session/delete", params)
         reply(request, {})
+    elif method == "session/set_mode" and mode == "replay":
+        reply(request, {})
+    elif method == "session/prompt" and mode == "replay":
+        if params["prompt"][0]["text"] != "/compact":
+            with open(value, encoding="utf-8") as frames:
+                for line in frames:
+                    update(json.loads(line))
+        reply(request, dict(stopReason="end_turn"))
     elif method == "session/prompt":
         if pending:
             update(dict(sessionUpdate="agent_message_chunk", content=dict(type="text", text=pending)))
@@ -139,11 +195,62 @@ for line in sys.stdin:
         full = params["prompt"][0]["text"]
         text = full.split("ACP_TEST:", 1)[-1]
         if text == "crash":
+            if mode in ["stderr-turn", "invalid-utf8-turn"]:
+                print("final-turn-cause", file=sys.stderr, flush=True)
+            if mode == "invalid-utf8-turn":
+                sys.stdout.buffer.write(b"\xff\n")
+                sys.stdout.buffer.flush()
+            if mode == "transport-noise":
+                print("discarded-prefix:" + "x" * 65536, flush=True)
+                update(dict(sessionUpdate="agent_message_chunk", content=dict(type="text", text="crashing")))
+                print("\u4ee3\u7406 final-stdout-banner", flush=True)
             sys.exit(4)
         if text == "error":
             send(dict(id=request["id"], error=dict(code=-32603, message="Model overloaded")))
             continue
         if text == "empty":
+            reply(request, dict(stopReason="end_turn"))
+            continue
+        # Like agy's async command: reported running, and never closed once its turn ends.
+        if text == "background":
+            update(dict(sessionUpdate="tool_call", toolCallId="background", kind="execute", title="sleep 600", status="in_progress"))
+            reply(request, dict(stopReason="end_turn"))
+            continue
+        # A command in a session of its own, as agy starts each of its commands, and a helper in the agent's own session.
+        if text in ["detached", "attached"]:
+            children[text] = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(600)"], start_new_session=text == "detached")
+            reply(request, dict(stopReason="end_turn"))
+            continue
+        if text == "detached-stderr":
+            code = """import socket, sys
+with socket.create_connection(('127.0.0.1', int(sys.argv[1]))) as gate:
+    gate.sendall(b'ready')
+    gate.recv(1)
+    sys.stderr.write('detached command is still writable\\n')
+    sys.stderr.flush()
+    gate.sendall(b'writable')
+"""
+            if mode == "orphan-stderr":
+                subprocess.run([sys.executable, "-c",
+                                "import subprocess, sys; subprocess.Popen([sys.executable, '-c', sys.argv[1], sys.argv[2]], start_new_session=True)",
+                                code, value], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, check=True)
+            else:
+                children[text] = subprocess.Popen([sys.executable, "-c", code, value],
+                                                  stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                                  start_new_session=True)
+            reply(request, dict(stopReason="end_turn"))
+            continue
+        if text == "end-detached":
+            children["detached"].kill()
+            children["detached"].wait()
+            reply(request, dict(stopReason="end_turn"))
+            continue
+        if text == "live-terminal":
+            terminal = reverse("terminal/create", dict(command=sys.executable, args=["-c", "import time; time.sleep(600)"]))["result"]["terminalId"]
+            reply(request, dict(stopReason="end_turn"))
+            continue
+        if text == "kill-live-terminal":
+            reverse("terminal/kill", dict(terminalId=terminal))
             reply(request, dict(stopReason="end_turn"))
             continue
         count += 1
@@ -152,10 +259,14 @@ for line in sys.stdin:
         update(dict(sessionUpdate="agent_thought_chunk", content=dict(type="text", text="thinking")))
         update(dict(sessionUpdate="tool_call", toolCallId="tool-one", title="Inspect file", kind="read", status="completed"))
         if text.startswith("permission"):
+            options = [dict(optionId="opaque-once", name="Allow this action", kind="allow_once"),
+                       dict(optionId="opaque-deny", name="Reject this action", kind="reject_once")]
+            if text == "permission-always":
+                options[0] = dict(optionId="opaque-always", name="Always allow", kind="allow_always")
+            if text == "permission-deny":
+                options = options[1:]
             send(dict(id="permission", method="session/request_permission", params=dict(sessionId=session,
-                toolCall=dict(toolCallId="tool-one", title="Inspect file"), options=[
-                    dict(optionId="opaque-once", name="Allow this action", kind="allow_once"),
-                    dict(optionId="opaque-deny", name="Reject this action", kind="reject_once")])))
+                toolCall=dict(toolCallId="tool-one", title="Inspect file", kind="switch_mode" if text == "permission-switch" else "read"), options=options)))
             update(dict(sessionUpdate="agent_message_chunk", content=dict(type="text", text="while waiting")))
             answer = json.loads(sys.stdin.readline())
             assert answer["id"] == "permission", answer

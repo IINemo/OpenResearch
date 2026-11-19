@@ -4,10 +4,10 @@ import { useQuery } from "@tanstack/react-query";
 
 import { m } from "../paraglide/messages.js";
 import { mutDeleteLatexTemplate, mutDeleteUserSkill, mutUpdateUserSkill, mutUploadLatexTemplate, mutUploadUserSkill } from "../queries/settings";
-import { ltr } from "../i18n";
+import { fmtBytes, ltr } from "../i18n";
 import { Pencil, RefreshCw, Trash2, Upload, X } from "lucide-react";
 import { useCallback, useId, useLayoutEffect, useRef, useState, type ReactNode } from "react";
-import { fmtBytes, fmtNumber, timeAgo, type LatexTemplate, type UserSkill, type SkillDiscovery } from "../api";
+import { fmtNumber, timeAgo, type LatexTemplate, type UserSkill, type SkillDiscovery } from "../api";
 import { Badge, Button, DialogContent, DialogTitle, IconButton, Spinner, Textarea, showAlert } from "./ui";
 import { copyToClipboard } from "../clipboard";
 
@@ -377,7 +377,7 @@ function SkillsCard() {
         return;
       }
       if (file.size > MAX_UPLOAD_BYTES) {
-        setError(m.skills_file_too_large());
+        setError(m.skills_file_too_large({ size: fmtBytes(MAX_UPLOAD_BYTES) }));
         return;
       }
       busyRef.current = true;
@@ -479,7 +479,7 @@ function LatexTemplatesCard() {
         return;
       }
       if (file.size > MAX_UPLOAD_BYTES) {
-        setError(m.skills_file_too_large());
+        setError(m.skills_file_too_large({ size: fmtBytes(MAX_UPLOAD_BYTES) }));
         return;
       }
       busyRef.current = true;
@@ -539,20 +539,9 @@ function LatexTemplatesCard() {
   );
 }
 
-/** Middle-pane Customize tab — what the agent brings to every session: the
- * skills it can invoke (uploaded here or mirrored from the user's coding
- * agents) and the LaTeX templates it writes papers into. Everything applies to
- * every project. */
+/** What the agent brings to every session: the skills it can invoke (uploaded
+ * here or mirrored from the user's coding agents) and the LaTeX templates it
+ * writes papers into. Everything applies to every project. */
 export function SkillsTab() {
-  return (
-    <div className="settings-view max-w-readable my-0 mx-auto pt-6 px-8 pb-15 [&_h1]:mt-0 [&_h1]:mx-0 [&_h1]:mb-1.5 [&_h1]:text-3xl">
-      <h1>{m.skills_tab_customize()}</h1>
-      <p className="mt-0 mx-0 mb-5 text-base leading-relaxed text-text">
-        {m.skills_overview_description()}
-      </p>
-
-      <SkillsCard />
-      <LatexTemplatesCard />
-    </div>
-  );
+  return <><SkillsCard /><LatexTemplatesCard /></>;
 }

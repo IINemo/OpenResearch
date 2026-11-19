@@ -100,13 +100,13 @@ import { WorkspaceTools } from "./components/WorkspaceTools";
 import { ProjectTerminal } from "./components/ProjectTerminal";
 import { SettingsCommandTerminal } from "./components/SshConnectTerminal";
 import { isWindowsDrivePath } from "./markdownTarget";
+import { projectLabel } from "./components/NoProject";
 import { ChatPanel, findPartById, spawnRowTitle, type FocusedMessage } from "./components/ChatPanel";
 import { OptionPicker, usePopover } from "./components/ModelPicker";
 import { SubagentTab } from "./components/SubagentTab";
 import { CodeTab, type CodeView } from "./components/CodeTab";
 import { WorktreeTab, type WorktreeView } from "./components/WorktreeTab";
 import { ArtifactsTab, findArtifactEntry } from "./components/ArtifactsTab";
-import { SkillsTab } from "./components/SkillsTab";
 import { ClosableTab } from "./components/ClosableTab";
 import { TabStrip } from "./components/TabStrip";
 import { DetailDrawer, type ExperimentView } from "./components/DetailDrawer";
@@ -253,7 +253,7 @@ const errorText = (error: unknown) => ltr(error instanceof Error ? error.message
 
 export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo; projectId: string; pane?: Pane }) {
   const { id: elementId } = useContext(WorkspaceDomContext);
-  const { onHostConnectRequest } = useWorkspace().events;
+  const { onHostConnectRequest, onComputeViewRequest, takeComputeView } = useWorkspace().events;
 
   const { showCustomDialog, showConfirmDialog } = useWorkspace().dialogs;
 
@@ -272,6 +272,7 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
     listRunsQuery,
     getArtifactsQuery,
     getChatMessagesQuery,
+    refreshChatMessages,
     readHarnesses,
   } = useWorkspace().queries;
   const {
@@ -288,7 +289,7 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
   const router = useRouter();
   const location = useRouterState({ select: (state) => state.location });
   const destination = parseDestination(location.pathname);
-  const mainView = destination?.kind === "skills" ? "skills" : destination?.kind === "settings" ? destination.section ?? "settings" : "chat";
+  const mainView = destination?.kind === "skills" ? "agents" : destination?.kind === "settings" ? destination.section ?? "settings" : "chat";
   const rememberedSessionRef = useRef<string | null>(null);
   const rememberedProjectRef = useRef(projectId);
   if (rememberedProjectRef.current !== projectId) {
@@ -334,12 +335,12 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
   const setProjectId = useCallback((id: string | null) => {
     void router.navigate({ href: id ? `/projects/${encodeURIComponent(id)}` : "/projects" });
   }, [router]);
-  const setMainView = useCallback((view: "chat" | "skills" | SettingsTab) => {
+  const setMainView = useCallback((view: "chat" | SettingsTab) => {
     if (!projectId) return;
     if (view === "chat") {
       const id = rememberedSessionRef.current;
       void router.navigate({ href: taskLocation(projectId, id, getTaskWorkspace(workspaceRef.current, id ?? "new")?.active) });
-    } else void router.navigate({ href: `/projects/${encodeURIComponent(projectId)}/${view === "skills" ? "skills" : `settings/${view}`}` });
+    } else void router.navigate({ href: `/projects/${encodeURIComponent(projectId)}/settings/${view}` });
   }, [router, projectId]);
 
   const locale = useLocale();
@@ -496,7 +497,7 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
       }
     }
     if (pendingViewFocus.current && pendingViewFocus.current === mainView) {
-      const view = bodyRef.current?.querySelector<HTMLElement>(".settings-view-scroll h1");
+      const view = bodyRef.current?.querySelector<HTMLElement>(".chat-pane h1");
       if (view) {
         view.focus();
         pendingViewFocus.current = null;
@@ -823,7 +824,7 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
 
   // The home, error, and loading screens leave projects populated but show no project.
   useEffect(() => {
-    const name = startupError || uiState === null ? null : activeProject?.name;
+    const name = startupError || uiState === null || !activeProject ? null : projectLabel(activeProject);
     const machine = runtime.kind === "ssh" ? `${autoDir(runtime.session.host)} — ` : "";
     document.title = name ? `${machine}${autoDir(name)} — OpenResearch` : `${machine}OpenResearch`;
   }, [startupError, uiState, activeProject, runtime]);
@@ -845,7 +846,7 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
     [projectId],
   );
   useEffect(() => {
-    if (mainView !== "chat" && mainView !== "skills") reportFirstAction("open_settings");
+    if (mainView !== "chat") reportFirstAction("open_settings");
   }, [mainView, reportFirstAction]);
 
   const openExperimentsTab = useCallback((replace = false) => {
@@ -927,7 +928,7 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
     baselineRunsRef.current.clear();
     pendingFirstRunningRunsRef.current.clear();
     const runsVisit = ++runsVisitRef.current;
-    queryClient.fetchQuery(listRunsQuery(baselineProjectId))
+    queryClient.fetchQuery({ ...listRunsQuery(baselineProjectId), staleTime: 0 })
       .then((loadedRuns) => {
         if (
           projectIdRef.current !== baselineProjectId ||
@@ -1534,10 +1535,10 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
     // Generation token: a reconnect starts fresh seeds, and a stale in-flight
     // response from an earlier generation must not land after them.
     let seedGen = 0;
-    const seed = () => {
+    const seed = (afterGap = false) => {
       const gen = ++seedGen;
       for (const sid of new Set(subagentTabs.map((t) => t.sessionId))) {
-        queryClient.fetchQuery({ ...getChatMessagesQuery(sid), staleTime: 0 })
+        (afterGap ? refreshChatMessages(sid) : queryClient.fetchQuery({ ...getChatMessagesQuery(sid), staleTime: 0 }))
           .then(({ messages }) => {
             if (live && gen === seedGen)
               apply(messages, subagentTabs.filter((t) => t.sessionId === sid), true);
@@ -1551,7 +1552,7 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
         // Frames lost during the outage may include the terminal update —
         // refetch, letting the fresh seed overwrite everything.
         liveUpdated.clear();
-        seed();
+        seed(true);
         return;
       }
       if (ev.type !== "message") return;
@@ -1644,12 +1645,21 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
 
   const focusOpenedView = (view: "settings" | "compute") => {
     pendingTabFocus.current = null;
-    const currentView = mainView === view ? bodyRef.current?.querySelector<HTMLElement>(".settings-view-scroll h1") : null;
+    const currentView = mainView === view ? bodyRef.current?.querySelector<HTMLElement>(".chat-pane h1") : null;
     if (currentView) currentView.focus();
     pendingViewFocus.current = currentView ? null : view;
     selectMainView(view);
   };
   useEffect(() => onHostConnectRequest(() => selectMainView("compute")), [selectMainView]);
+  const focusOpenedViewRef = useRef(focusOpenedView);
+  focusOpenedViewRef.current = focusOpenedView;
+  useEffect(() => {
+    const take = () => {
+      if (takeComputeView()) focusOpenedViewRef.current("compute");
+    };
+    take();
+    return onComputeViewRequest(take);
+  }, [onComputeViewRequest, takeComputeView]);
 
   const focusedRegion = useSyncExternalStore(subscribeCommandRegion, commandRegion);
   useHotkey(appHotkeys["tab.close"], () => {
@@ -1767,7 +1777,7 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
   };
 
   function onProjectCreated(project: Project, publicationError: string | null) {
-    void router.navigate({ href: `/projects/${encodeURIComponent(project.id)}${publicationError ? "/settings/projects" : ""}` });
+    void router.navigate({ href: `/projects/${encodeURIComponent(project.id)}${publicationError ? "/settings/project" : ""}` });
     if (publicationError) {
       showAlert(publicationError, "error");
     }
@@ -2055,7 +2065,7 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
           <ChatPanel
             find={mainFind}
             projectId={projectId}
-            projectName={activeProject.name}
+            projectName={projectLabel(activeProject)}
             contentLoading={conversationLoading}
             contentError={conversationError || null}
             onRetryContent={retryConversation}
@@ -2101,14 +2111,13 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
             preferredAutonomy={uiState.preferredAutonomy ?? DEFAULT_AUTONOMY}
             onPreferredAutonomyChange={persistPreferredAutonomy}
           >
-            {mainView === "skills" ? (
-              <SkillsTab />
-            ) : mainView !== "chat" ? (
+            {mainView !== "chat" ? (
               <SettingsView
                 remote={runtime.kind === "ssh"}
                 tab={mainView}
                 project={activeProject}
                 onSelectTab={selectMainView}
+                onProjectRemoved={() => setProjectId(null)}
               />
             ) : null}
           </ChatPanel>
@@ -2517,7 +2526,7 @@ export default function App({ runtime, projectId, pane }: { runtime: RuntimeInfo
                       embedded
                       composerFocusNonce={sideComposerFocusNonce}
                       projectId={projectId}
-                      projectName={activeProject?.name ?? ""}
+                      projectName={activeProject ? projectLabel(activeProject) : ""}
                       railOpen={false}
                       onShowRail={() => setRailOpen(true)}
                       mainView="chat"

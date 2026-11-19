@@ -34,26 +34,16 @@ const LR_PROBE_EXPERIMENT_ID: &str = "demo_nanochat_lr_probe_v1";
 const LR_PROBE_BRANCH: &str = "orx/tiny-learning-rate-probe-interactive";
 const VOCAB_PROBE_EXPERIMENT_ID: &str = "demo_nanochat_vocab_probe_v1";
 const VOCAB_PROBE_BRANCH: &str = "orx/vocab-8192-probe";
-// Git Bash: uv has no shell installer there, and venvs may use `Scripts/` not `bin/`.
-fn probe_uv() -> String {
-    let install_uv = if cfg!(windows) {
-        "powershell -NoProfile -ExecutionPolicy Bypass -Command \"irm https://astral.sh/uv/install.ps1 | iex\""
-    } else {
-        "curl -LsSf https://astral.sh/uv/install.sh | sh"
-    };
-    format!(
-        "export NANOCHAT_BASE_DIR=\"$PWD/.cache/nanochat\" UV_CACHE_DIR=\"${{ORX_CACHE_DIR:-$HOME/.cache/openresearch}}/uv\" \
-         && mkdir -p \"$NANOCHAT_BASE_DIR\" \"$UV_CACHE_DIR\" \
-         && {{ command -v uv >/dev/null || {{ {install_uv} && export PATH=\"$HOME/.local/bin:$PATH\"; }}; }}"
-    )
-}
+// Git Bash venvs keep their scripts in `Scripts/`, not `bin/`.
+const PROBE_UV: &str = "export NANOCHAT_BASE_DIR=\"$PWD/.cache/nanochat\" UV_CACHE_DIR=\"${ORX_CACHE_DIR:-$HOME/.cache/openresearch}/uv\" \
+     && mkdir -p \"$NANOCHAT_BASE_DIR\" \"$UV_CACHE_DIR\" \
+     && { command -v uv >/dev/null || { curl -LsSf https://astral.sh/uv/install.sh | sh && export PATH=\"$HOME/.local/bin:$PATH\"; }; }";
 
 fn probe_setup() -> String {
     format!(
-        "{} && ([ -d .venv ] || uv venv) && uv sync --extra cpu \
+        "{PROBE_UV} && ([ -d .venv ] || uv venv) && uv sync --extra cpu \
          && {{ . .venv/bin/activate 2>/dev/null || . .venv/Scripts/activate; }} \
-         && python -m nanochat.dataset -n 8",
-        probe_uv()
+         && python -m nanochat.dataset -n 8"
     )
 }
 
@@ -150,6 +140,8 @@ The `evidence/` directory contains the real checkpoint metadata, trained tokeniz
 "#;
 
 const RUN_LOG: &str = include_str!("../../demo/nanochat/run-output.txt");
+/// The leading "n" of nanochat's wordmark, cropped square.
+const PROJECT_ICON: &[u8] = include_bytes!("../../demo/nanochat/icon.png");
 // The log's own timestamps run 10:51:52 -> 14:33:21; the seeded run must span them.
 const RUN_LOG_SPAN_MIN: i64 = 222;
 
@@ -467,6 +459,10 @@ fn seed_at(
         repo_path: repo.to_string_lossy().into_owned(),
         run_command: Some("bash runs/runcpu.sh".into()),
         paper_id: None,
+        icon: Some(serde_json::json!({ "image": {
+            "type": "image/png",
+            "data": base64::Engine::encode(&base64::engine::general_purpose::STANDARD, PROJECT_ICON),
+        } })),
         created_at: ago(seeded_at, 250, 0),
         updated_at: ago(seeded_at, 6, 0),
     };
@@ -499,10 +495,7 @@ fn seed_at(
                 "Train a real 0.8M-parameter nanochat model for 20 steps per arm on bundled text, comparing AdamW LR 0.001 with 0.002 from identical initialization and batches. Saves training/held-out validation loss, an interactive HTML loss chart, and raw metrics. No dataset download or full tokenizer training. Demonstrates early optimization, not coherent generation; results are separate from the recorded 73.5M baseline. First use prepares Python dependencies."
                     .into(),
             ),
-            run_command: format!(
-                "{} && uv run --script scripts/demo_probe.py",
-                probe_uv()
-            ),
+            run_command: format!("{PROBE_UV} && uv run --script scripts/demo_probe.py"),
             agent_status: "idle".into(),
             created_at: ago(seeded_at, 8, 0),
             updated_at: ago(seeded_at, 8, 0),
@@ -2279,6 +2272,7 @@ mod tests {
                 repo_path: root.join("user-nanochat").to_string_lossy().into_owned(),
                 run_command: None,
                 paper_id: None,
+                icon: None,
                 created_at: 1,
                 updated_at: 1,
             })

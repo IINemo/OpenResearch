@@ -112,9 +112,10 @@ export function createSettingsQueries(client: WorkspaceClient, api: Api, events:
     }, queryClient);
   };
 
-  const getEnvVarsQuery = () => queryOptions({
-    queryKey: workspaceKey("getEnvVars"),
-    queryFn: ({ signal }) => api.getEnvVars(signal),
+  /** With a project, also that project's own variables. */
+  const getEnvVarsQuery = (projectId?: string) => queryOptions({
+    queryKey: workspaceKey("getEnvVars", projectId ?? null),
+    queryFn: ({ signal }) => api.getEnvVars(projectId, signal),
     staleTime: 300_000,
   });
 
@@ -124,6 +125,14 @@ export function createSettingsQueries(client: WorkspaceClient, api: Api, events:
     queryFn: ({ signal }) => api.getTrackioRuns(projectId, signal),
     staleTime: 15_000,
     refetchInterval: live ? 15_000 : false,
+  });
+
+  const getTrackioRunMetricsQuery = (projectId: string, runId: string, live: boolean) => queryOptions({
+    // Keyed by liveness too, so a run that just ended reads its final values once.
+    queryKey: workspaceKey("getTrackioRunMetrics", projectId, runId, live),
+    queryFn: ({ signal }) => api.getTrackioRunMetrics(projectId, runId, signal),
+    staleTime: live ? 15_000 : 300_000,
+    refetchInterval: live ? 30_000 : false,
   });
 
   /** Also refetches once a run ends: Trackio flushes on `finish()`, after the last poll. */
@@ -184,6 +193,12 @@ export function createSettingsQueries(client: WorkspaceClient, api: Api, events:
     staleTime: 2_000,
   });
 
+  const listRemoteHostsQuery = () => queryOptions({
+    queryKey: workspaceKey("listRemoteHosts"),
+    queryFn: ({ signal }) => api.listRemoteHosts(signal),
+    staleTime: 30_000,
+  });
+
   const listRemoteSessionsQuery = () => queryOptions({
     queryKey: workspaceKey("listRemoteSessions"),
     queryFn: ({ signal }) => api.listRemoteSessions(signal),
@@ -194,6 +209,15 @@ export function createSettingsQueries(client: WorkspaceClient, api: Api, events:
     queryKey: workspaceKey("getUpdateStatus"),
     queryFn: ({ signal, client, queryKey }) => readLiveSnapshot(client, queryKey, () => api.getUpdateStatus(signal)),
     staleTime: 30_000,
+  });
+
+  /** Plans, spend and, with `chat`, that chat's compute; null from an `orx up` without the route. */
+  const getUsageQuery = (chat: string | null = null) => queryOptions({
+    queryKey: workspaceKey("getUsage", chat),
+    queryFn: ({ signal }) => api.getUsage(chat, signal),
+    staleTime: 60_000,
+    // Paused while the window is hidden; the server re-reads plans only past a minute old.
+    refetchInterval: 5 * 60_000,
   });
 
   const getPendingWorkQuery = () => queryOptions({
@@ -312,6 +336,14 @@ export function createSettingsQueries(client: WorkspaceClient, api: Api, events:
     staleTime: 30_000,
   });
 
+  const getModelFeedQuery = () => queryOptions({
+    queryKey: workspaceKey("getModelFeed"),
+    queryFn: ({ signal }) => api.getModelFeed(signal),
+    // `orx up` replaces the feed in the background, the first time before the page may have read it.
+    staleTime: 300_000,
+    refetchInterval: 300_000,
+  });
+
   const reportLocaleQuery = (locale: string) => queryOptions({
     queryKey: workspaceKey("reportLocale", locale),
     queryFn: ({ signal }) => api.reportLocale(locale, signal),
@@ -341,6 +373,7 @@ export function createSettingsQueries(client: WorkspaceClient, api: Api, events:
     getEnvVarsQuery,
     getTrackioRunsQuery,
     useTrackioRuns,
+    getTrackioRunMetricsQuery,
     getDataDirQuery,
     getSshSettingsQuery,
     setEngineHost,
@@ -348,8 +381,10 @@ export function createSettingsQueries(client: WorkspaceClient, api: Api, events:
     getSshConfigQuery,
     getSshMasterStatusQuery,
     getRuntimeQuery,
+    listRemoteHostsQuery,
     listRemoteSessionsQuery,
     getUpdateStatusQuery,
+    getUsageQuery,
     getPendingWorkQuery,
     getBuildNotesQuery,
     getLitSourcesQuery,
@@ -368,6 +403,7 @@ export function createSettingsQueries(client: WorkspaceClient, api: Api, events:
     readHarnesses,
     getLocalModelsQuery,
     getOpenCodeProvidersQuery,
+    getModelFeedQuery,
     reportLocaleQuery,
   };
 }
@@ -497,6 +533,16 @@ export const mutSetComputeDefault = mutations.define({
   refetchOnSuccess: false,
 });
 
+/** The re-read's result arrives as `usage.changed`, which refetches every usage query. */
+export const mutRefreshUsage = mutations.define({
+  id: "usage/refresh",
+  mutate: (ws: Workspace) => ws.api.refreshUsage(),
+  optimistic: () => {},
+  describe: "refresh usage",
+  describeResult: null,
+  refetchOnSuccess: false,
+});
+
 export const mutRetryEngineHost = mutations.define({
   id: "settings/engine-host-retry",
   mutate: (ws: Workspace, alias: string) => ws.api.retryEngineHost(alias),
@@ -508,11 +554,28 @@ export const mutRetryEngineHost = mutations.define({
   refetchOnSuccess: false,
 });
 
+/** Each cached env list, keyed by the project it shows (null for none). */
+function envViews(ws: Workspace) {
+  const family = ws.queries.getEnvVarsQuery().queryKey.slice(0, -1);
+  return ws.queryClient.getQueryCache().findAll({ queryKey: family })
+    .map((query) => ({ key: query.queryKey, projectId: query.queryKey.at(-1) as string | null }));
+}
+
+/** Shows a saved list everywhere it appears: the global one in every view, a project's in its own. */
+function showEnvSettings(ws: Workspace, projectId: string | undefined, saved: api.EnvSettings) {
+  for (const view of envViews(ws)) {
+    ws.queryClient.setQueryData<api.EnvSettings>(view.key, (shown) => shown && {
+      vars: saved.vars,
+      projectVars: view.projectId === projectId && saved.projectVars ? saved.projectVars : shown.projectVars,
+    });
+  }
+}
+
 export const mutSetEnvVar = mutations.define({
   id: "settings/env-set",
-  mutate: (ws: Workspace, key: string, value: string) => ws.api.setEnvVar(key, value),
-  optimistic({ args: [ws], onSuccess }) {
-    onSuccess((vars) => ws.setScopedQueryData(ws.queries.getEnvVarsQuery().queryKey, vars));
+  mutate: (ws: Workspace, change: api.EnvVarChange) => ws.api.setEnvVar(change),
+  optimistic({ args: [ws, change], onSuccess }) {
+    onSuccess((saved) => showEnvSettings(ws, change.projectId, saved));
   },
   key: ({ args: [ws] }) => [ws.identity, "env"],
   describe: "save the variable",
@@ -522,11 +585,18 @@ export const mutSetEnvVar = mutations.define({
 
 export const mutDeleteEnvVar = mutations.define({
   id: "settings/env-delete",
-  mutate: (ws: Workspace, key: string) => ws.api.deleteEnvVar(key),
-  optimistic({ helpers, args: [ws, key], onSuccess }) {
-    const options = ws.queries.getEnvVarsQuery();
-    helpers(ws.queryClient).arrayFilter(options, (entry) => entry.key !== key);
-    onSuccess((vars) => ws.setScopedQueryData(options.queryKey, vars));
+  mutate: (ws: Workspace, key: string, projectId?: string) => ws.api.deleteEnvVar(key, projectId),
+  optimistic({ args: [ws, key, projectId], onRestore, onSuccess }) {
+    const views = envViews(ws);
+    const before = views.map((view) => [view.key, ws.queryClient.getQueryData<api.EnvSettings>(view.key)] as const);
+    const drop = (vars: api.EnvVar[] | undefined) => vars?.filter((entry) => entry.key !== key);
+    for (const view of views) {
+      ws.queryClient.setQueryData<api.EnvSettings>(view.key, (shown) => shown && (projectId
+        ? view.projectId === projectId ? { ...shown, projectVars: drop(shown.projectVars) } : shown
+        : { ...shown, vars: drop(shown.vars) ?? [] }));
+    }
+    onRestore(() => { for (const [key, shown] of before) ws.queryClient.setQueryData(key, shown); });
+    onSuccess((saved) => showEnvSettings(ws, projectId, saved));
   },
   key: ({ args: [ws] }) => [ws.identity, "env"],
   describe: "delete the variable",
@@ -697,6 +767,57 @@ export const mutSaveSshHost = mutations.define({
   },
   key: ({ args: [ws, host] }) => [ws.identity, "ssh-host", host],
   describe: "save the host's settings",
+  describeResult: null,
+  refetchOnSuccess: false,
+});
+
+export const mutAddComputeHost = mutations.define({
+  id: "settings/ssh-host-add",
+  async mutate(ws: Workspace, command: string) {
+    const host = await ws.api.addComputeHost(command);
+    await ws.queryClient.invalidateQueries(ws.queries.getSshSettingsQuery());
+    return host;
+  },
+  optimistic: () => {},
+  describe: "add the host",
+  describeResult: null,
+  refetchOnSuccess: false,
+});
+
+export const mutRemoveComputeHost = mutations.define({
+  id: "settings/ssh-host-remove",
+  async mutate(ws: Workspace, host: string) {
+    await ws.api.removeComputeHost(host);
+    await ws.queryClient.invalidateQueries(ws.queries.getSshSettingsQuery());
+  },
+  optimistic: () => {},
+  key: ({ args: [ws, host] }) => [ws.identity, "ssh-host", host],
+  describe: "remove the host",
+  describeResult: null,
+  refetchOnSuccess: false,
+});
+
+export const mutAddRemoteHost = mutations.define({
+  id: "remote/host-add",
+  async mutate(ws: Workspace, command: string) {
+    const host = await ws.api.addRemoteHost(command);
+    await ws.queryClient.invalidateQueries(ws.queries.listRemoteHostsQuery());
+    return host;
+  },
+  optimistic: () => {},
+  describe: "add the remote",
+  describeResult: null,
+  refetchOnSuccess: false,
+});
+
+export const mutRemoveRemoteHost = mutations.define({
+  id: "remote/host-remove",
+  mutate: (ws: Workspace, host: string) => ws.api.removeRemoteHost(host),
+  optimistic({ helpers, args: [ws, host] }) {
+    helpers(ws.queryClient).arrayRemove(ws.queries.listRemoteHostsQuery(), (entry) => entry.host === host);
+  },
+  key: ({ args: [ws, host] }) => [ws.identity, "remote-host", host],
+  describe: "remove the remote",
   describeResult: null,
   refetchOnSuccess: false,
 });
