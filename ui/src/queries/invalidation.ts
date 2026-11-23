@@ -21,7 +21,7 @@ export function isImmutableQuery(query: Query) {
 const fileBodies = ["resolvedFile", "getProjectFile", "getArtifactFileText", "getArtifactFileMetadata"];
 
 export const artifactFamilies = ["getArtifacts", "getArtifactFileText", "getArtifactFileMetadata"];
-const liveFamilies = ["getSessionExperiments", "getSubagentTranscript", "listChatActiveRuns", "listProjects", "listProjectActivity", "listSidebarChatSessions", "listExperiments", "listRuns", "listChatSessions", "getChatMessages", "getHarnesses", "getUpdateStatus", "getUsage", ...artifactFamilies, ...fileBodies, "getAbsoluteFile", "fileVersion", "getCodeTree", "getSessionWorktree", "getRunDiff", "getExperimentDiff", "listEngineHosts"];
+export const liveFamilies = ["getSessionExperiments", "getSubagentTranscript", "listChatShownRuns", "getRunMonitor", "listProjects", "listProjectActivity", "listSidebarChatSessions", "listExperiments", "listRuns", "listChatSessions", "getChatMessages", "getHarnesses", "getUpdateStatus", "getUsage", ...artifactFamilies, ...fileBodies, "getAbsoluteFile", "fileVersion", "getCodeTree", "getSessionWorktree", "getRunDiff", "getExperimentDiff", "listEngineHosts"];
 
 const settingsFamilies: Record<string, readonly string[]> = {
   hf: ["getHfSettings", "getComputeSettings", "getEnvVars", "getTrackioRuns"],
@@ -163,6 +163,10 @@ export function createInvalidation(client: WorkspaceClient) {
     if (project) {
       const [, projectId, action] = project;
       if (action.startsWith("/file")) { invalidateProjectFiles(projectId, scope, true); return; }
+      if (action === "/settings") {
+        invalidate(["getProjectSettings", "getComputeSettings"], scope, (query) => query.queryKey[3] === projectId);
+        return;
+      }
       invalidate(["listProjects", "listProjectActivity", "listSidebarChatSessions"], scope);
       invalidate(["getProjectGitStatus", "getCodeTree", "getProjectStarterPrompts"], scope, (query) => query.queryKey[3] === projectId);
       return;

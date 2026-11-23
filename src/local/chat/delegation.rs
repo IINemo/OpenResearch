@@ -107,16 +107,6 @@ fn mode_rank(mode: PermissionMode) -> u8 {
     }
 }
 
-/// Whether `caller` may message `target` without widening what it can do: a
-/// target that may do more unasked than its caller, or whose modes orx cannot
-/// read, is the user's to steer.
-pub fn within_reach(caller: &StoredChatSession, target: &StoredChatSession) -> bool {
-    match (permission_rank(caller), permission_rank(target)) {
-        (Some(caller), Some(target)) => target <= caller,
-        _ => false,
-    }
-}
-
 /// The broadest mode the delegate's harness offers that is no broader than
 /// the delegator's. Plan narrows to asking: a delegate is sent to do its task.
 /// A delegator whose modes orx cannot read gets a delegate that asks.
@@ -137,11 +127,14 @@ pub fn delegate_permission(parent: &StoredChatSession, harness_id: &str) -> Resu
             ))
         };
     }
+    let bypass_unconfirmed = harness_id == "claude-code"
+        && harness::claude::full_access() == harness::claude::FullAccess::NeedsRootConsent;
     choices
         .iter()
         .filter_map(|choice| {
             PermissionMode::from_id(&choice.id)
                 .filter(|mode| *mode != PermissionMode::Plan)
+                .filter(|mode| !(bypass_unconfirmed && *mode == PermissionMode::Bypass))
                 .map(|mode| (mode_rank(mode), choice.id.clone()))
         })
         .filter(|(rank, _)| *rank <= ceiling)
@@ -923,6 +916,7 @@ mod tests {
             client_turn_id: "ct_1".into(),
             request_hash: "hash".into(),
             prepared_input: "task".into(),
+            flag_input: None,
             settings_json: "{}".into(),
             state: "preparing".into(),
             delivery_state: "not_sent".into(),

@@ -23,6 +23,10 @@ train/evaluation command and compute-specific requirements; ask only if the
 project setup leaves these or the chosen workflow unclear. Record the durable
 setup and execution recipe in the project's run command.
 
+Make the baseline followable before its first launch: its stages, the
+measures that answer the question, and the view that draws them. Load
+`orx-experiment-runs` and follow it; children inherit all of it.
+
 ## Provisional until it answers — repair, don't branch
 
 Every node exists to establish a baseline or test a hypothesis. A run that dies
@@ -87,7 +91,7 @@ resolved, stacked** (one level down per winner kept). A new *round* never hangs 
 the root — it hangs off the previous round's winner. That keeps the tree moving
 **downward** as research progresses, without stringing unrelated nodes into a line.
 
-Re-read the tree each round — `orx project view <projectId>` lists every node
+Re-read the tree each round — `orx project view` lists every node
 (id, title, branch; roots marked `[root]`) — and check the shape: a wide row of
 direct children off the root with no grandchildren means you're fanning when you
 should be descending; a long depth-N chain with no branching means you're chaining
@@ -108,7 +112,9 @@ intended flow — do **not** edit a frozen node or rewrite the run command:
    different rounds into one batch — that's what produces the flat fan.
 3. **Create the round as a bush, and pick its parent deliberately.** All of this
    round's options are **siblings under one parent** — the title is the idea, the
-   description is the concrete change you'll make on that node's branch. The parent is:
+   description is the concrete change you'll make on that node's branch. The user
+   reads the title beside the run's progress, among its siblings: keep it short,
+   the setting that varies first ("Depth 4 at 2e15 FLOPs", "LR 3e-4"). The parent is:
    - the **baseline**, only for the very first round (nothing has been won yet); or
    - the **previous round's confirmed winner**, for every round after — so this
      round's changes build *on top of* the last gain instead of resetting to the
@@ -116,13 +122,13 @@ intended flow — do **not** edit a frozen node or rewrite the run command:
 
    ```sh
    # Round 1 — one decision (the LR), its options fanned off the baseline:
-   orx create-experiment <projectId> --parent <baseId> --title "LR 2e-5" \
+   orx create-experiment --parent <baseId> --title "LR 2e-5" \
      --description "Set the LR in config.yaml to 2e-5; change nothing else."
-   orx create-experiment <projectId> --parent <baseId> --title "LR 3e-5" \
+   orx create-experiment --parent <baseId> --title "LR 3e-5" \
      --description "Set the LR in config.yaml to 3e-5; change nothing else."
 
    # Round 2 — LR 3e-5 won → the next decision (architecture) descends onto it:
-   orx create-experiment <projectId> --parent <lr3e5WinnerId> --title "Wider MLP" \
+   orx create-experiment --parent <lr3e5WinnerId> --title "Wider MLP" \
      --description "On top of the LR-3e-5 winner, widen the MLP hidden dim 1024→2048 in model.py."
    ```
    The child inherits its parent's run command automatically — you don't set it,
@@ -143,7 +149,7 @@ intended flow — do **not** edit a frozen node or rewrite the run command:
    CPU, RAM, and GPU.
 6. **Launch, then end your turn.** Relevant run results arrive as messages in
    this chat once it is idle. No waiting process or live agent session is needed.
-   On each message, read `orx runs <projectId>` and reconcile every newly terminal
+   On each message, read `orx runs` and reconcile every newly terminal
    run, including those that finished while you were analyzing another result.
    Analyze each result and refill its slot as appropriate; other runs can keep
    going. End your turn again after launching ready children. When every run is
@@ -199,8 +205,7 @@ cat notes.md | orx exp desc <expId> --stdin   # overwrite from stdin (long markd
 - **Write** with exactly one of `--set` (inline) or `--stdin` (whole of stdin).
   Passing both is an error. Writing **replaces** the entire description — to
   append, read first, edit, and write back.
-- `<expId>` comes from `orx create-experiment` output or `orx project view
-  <projectId>` (the experiment id, not a run or project id).
+- `<expId>` comes from `orx create-experiment` output or `orx project view` (the experiment id, not a run or project id).
 
 ## Restructure the tree — `orx exp move` and `orx exp archive`
 
