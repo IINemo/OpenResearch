@@ -1284,7 +1284,6 @@
   "git_diff_back_to_preview": "Quay lại xem trước",
   "git_diff_view_full": "Xem toàn bộ diff",
   "plan_command_description": "Chuyển đổi chế độ Kế hoạch cho cuộc trò chuyện này",
-  "goal_command_description": "Giữ cho agent làm việc hướng tới mục tiêu",
   "chat_goal_set": "Đã đặt mục tiêu",
   "chat_goal_cleared": "Đã xóa mục tiêu",
   "chat_goal_current": "Mục tiêu hiện tại: {goal}",
@@ -2558,5 +2557,17 @@
   "lit_sources_save_project": "Lưu cho dự án này",
   "lit_sources_save_all": "Lưu cho mọi dự án",
   "lit_sources_revert": "Dùng nguồn của dự án",
-  "project_settings_autonomy_title": "Mức tự chủ cho cuộc trò chuyện mới"
+  "project_settings_autonomy_title": "Mức tự chủ cho cuộc trò chuyện mới",
+  "goal_command_usage": "Giữ cho agent làm việc hướng tới mục tiêu. Bắt đầu bằng khoảng thời gian, như 7d:, để agent tự làm việc đến hết thời hạn",
+  "chat_goal_set_until": "Đã đặt mục tiêu. Agent tự làm việc đến {deadline}",
+  "chat_panel_goal_time_left": "Mục tiêu: còn {time}",
+  "chat_panel_goal_met": "Đã đạt mục tiêu",
+  "chat_panel_goal_expired": "Mục tiêu đã kết thúc",
+  "chat_panel_goal_paused": "Mục tiêu tạm dừng",
+  "chat_panel_clear_timed_goal": "Xóa mục tiêu có thời hạn",
+  "chat_goal_active_note": "Agent tự làm việc đến {deadline}.",
+  "chat_goal_met_note": "Agent báo đã đạt mục tiêu: {evidence}",
+  "chat_goal_expired_note": "Đã qua thời hạn {deadline}.",
+  "chat_goal_blocked_note": "Đã tạm dừng. Agent cần bạn: {reason}",
+  "chat_goal_stalled_note": "Đã tạm dừng vì nhiều lượt liên tiếp không bắt đầu lần chạy mới. Đặt lại mục tiêu để tiếp tục."
 }
