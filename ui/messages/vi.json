@@ -2564,7 +2564,7 @@
   "chat_panel_goal_met": "Đã đạt mục tiêu",
   "chat_panel_goal_expired": "Mục tiêu đã kết thúc",
   "chat_panel_goal_paused": "Mục tiêu tạm dừng",
-  "chat_panel_clear_timed_goal": "Xóa mục tiêu có thời hạn",
+  "chat_panel_clear_timed_goal": "{status} Xóa mục tiêu: {goal}",
   "chat_goal_active_note": "Agent tự làm việc đến {deadline}.",
   "chat_goal_met_note": "Agent báo đã đạt mục tiêu: {evidence}",
   "chat_goal_expired_note": "Đã qua thời hạn {deadline}.",
