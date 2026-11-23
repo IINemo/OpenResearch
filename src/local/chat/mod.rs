@@ -14034,6 +14034,7 @@ mod run_wakeup_tests {
                 id: "p1".into(),
                 name: "goal".into(),
                 icon: None,
+                proposal: None,
                 slug: "goal".into(),
                 github_owner: String::new(),
                 github_repo: String::new(),

@@ -13590,6 +13590,7 @@ pub(crate) mod tests {
                 context_usage_json: None,
                 bootstrap_context: None,
                 goal: None,
+                goal_pursuit: None,
                 autonomy: autonomy.map(str::to_owned),
                 active_leaf_id: None,
                 side_parent_session_id: None,
